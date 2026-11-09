@@ -1,0 +1,19 @@
+streamlit
+matplotlib
+scipy
+plotly
+pyvista
+numba
+meshio
+pandas
+h5py
+#torch              # optional
+pillow             # for GIF animation
+imageio-ffmpeg     # for MP4 animation
+cupy-cuda12x  # For CUDA 11.x pip install cupy-cuda11x
+imageio
+imageio-ffmpeg
+seaborn
+torch
+torch-vision
+torch-geometric
