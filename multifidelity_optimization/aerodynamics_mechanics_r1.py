@@ -1505,8 +1505,13 @@ def main():
         cruise_speed = st.slider("cruise speed (m/s)",
                                   *spec['cruise_speed_range'],
                                   np.mean(spec['cruise_speed_range']), 0.5)
+        # NOTE: prop_rpm_range is stored as (int, int) in every drone class
+        # spec, so min_value/max_value/step are all int. Streamlit's
+        # st.slider requires the default value to share the same dtype,
+        # therefore we must cast np.mean(...) -> int. Using a float default
+        # here raises StreamlitInvalidParameterTypeError at app startup.
         prop_rpm = st.slider("prop RPM", *spec['prop_rpm_range'],
-                              np.mean(spec['prop_rpm_range']), 100)
+                              int(np.mean(spec['prop_rpm_range'])), 100)
 
         eval_design = {
             'arm_length': float(arm_L),
@@ -1613,12 +1618,14 @@ def main():
             vis = FPVDroneVisualizer()
             # Surrogate surface
             st.subheader("Response surface (arm_L vs prop_D)")
-            fig_s = vis.plot_surrogate_surface(
-                opt.surrogate if 'opt' in dir() else
-                CokrigingSurrogate().fit(
-                    result['X_low'], result['y_low'],
-                    result['X_high'], result['y_high']))
-            # We need to refit the surrogate because `opt` may be out of scope
+            # Refit the surrogate from the stored optimisation result. We
+            # cannot reuse the `opt` local from the Optimise tab because
+            # Streamlit reruns the script top-to-bottom on every interaction
+            # and `opt` is only defined inside that tab's `if st.button(...)`
+            # block. Reconstructing the surrogate here is cheap (the design
+            # vectors are already in session_state) and avoids the previous
+            # dead-code branch that called CokrigingSurrogate().fit(...) and
+            # then immediately overwrote the result.
             surr = CokrigingSurrogate()
             surr.fit(result['X_low'], result['y_low'],
                       result['X_high'], result['y_high'])
