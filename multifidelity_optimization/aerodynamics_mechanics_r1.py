@@ -1247,6 +1247,17 @@ class FPVDroneVisualizer:
         d = X_low.shape[1]
         fig, axes = plt.subplots(d, d, figsize=(2.0 * d, 2.0 * d))
         cmap = _CUSTOM_COLORMAPS['ld']
+        # Remember the FIRST scatter PathCollection we create, so we can
+        # hand it directly to fig.colorbar() below. The previous code did:
+        #     plt.colorbar(ax.collections[0] if ax.collections else
+        #                  fig.axes[0].collections[0], ...)
+        # which crashes with IndexError when the last visited `ax` is on
+        # the diagonal (histogram -> no collections) AND the first axes
+        # is also a histogram (no collections). The @handle_errors
+        # decorator then turns that into a FAILED sentinel, and the
+        # caller's st.pyplot(fig_d) dies with:
+        #     AttributeError: '_Sentinel' object has no attribute 'savefig'
+        scatter_mappable = None
         for i in range(d):
             for j in range(d):
                 ax = axes[i, j]
@@ -1258,7 +1269,11 @@ class FPVDroneVisualizer:
                 elif i > j:
                     # Lower triangle: scatter low-fidelity
                     sc = ax.scatter(X_low[:, j], X_low[:, i],
-                                    c=y_low, cmap=cmap, s=20, alpha=0.7)
+                                    c=y_low, cmap=cmap, s=20, alpha=0.7,
+                                    vmin=float(np.nanmin(y_low)),
+                                    vmax=float(np.nanmax(y_low)))
+                    if scatter_mappable is None:
+                        scatter_mappable = sc
                     # Overlay high-fidelity points
                     ax.scatter(X_high[:, j], X_high[:, i],
                                c='red', s=60, marker='*',
@@ -1271,15 +1286,25 @@ class FPVDroneVisualizer:
                     ax.set_xlabel(dim_names[j])
                 if j == 0 and i != j:
                     ax.set_ylabel(dim_names[i])
-        # Add a single colorbar
+        # Add a single colorbar using the remembered scatter mappable.
+        if scatter_mappable is None:
+            # Degenerate input (no lower-triangle scatters drawn).
+            # Synthesise a blank ScalarMappable so the colorbar still renders
+            # instead of crashing the whole tab.
+            from matplotlib.cm import ScalarMappable
+            from matplotlib.colors import Normalize
+            scatter_mappable = ScalarMappable(
+                norm=Normalize(vmin=0.0, vmax=1.0), cmap=cmap)
+            scatter_mappable.set_array(np.array([0.0, 1.0]))
         fig.subplots_adjust(right=0.92)
         cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
-        plt.colorbar(ax.collections[0] if ax.collections else
-                     fig.axes[0].collections[0], cax=cbar_ax, label='L/D')
+        fig.colorbar(scatter_mappable, cax=cbar_ax, label='L/D')
         if any('CFD' in ax.get_legend_handles_labels()[1]
                for ax in fig.axes):
             fig.legend(loc='upper right', fontsize=8)
-        plt.tight_layout()
+        # NOTE: do NOT call plt.tight_layout() here - it would override the
+        # manual subplots_adjust(right=0.92) used to reserve room for the
+        # colorbar, and would also collide with the manually-added cbar_ax.
         return fig
 
     @handle_errors
@@ -1630,15 +1655,21 @@ def main():
             surr.fit(result['X_low'], result['y_low'],
                       result['X_high'], result['y_high'])
             fig_s = vis.plot_surrogate_surface(surr)
-            st.pyplot(fig_s)
-            plt.close(fig_s)
+            if fig_s is FAILED:
+                st.error("Surrogate surface plot failed - see app logs.")
+            else:
+                st.pyplot(fig_s)
+                plt.close(fig_s)
             # Design-space scatter
             st.subheader("Design-space samples")
             fig_d = vis.plot_design_space(
                 result['X_low'], result['y_low'],
                 result['X_high'], result['y_high'])
-            st.pyplot(fig_d)
-            plt.close(fig_d)
+            if fig_d is FAILED:
+                st.error("Design-space plot failed - see app logs.")
+            else:
+                st.pyplot(fig_d)
+                plt.close(fig_d)
 
     # ----- Convergence tab -----
     with tabs[4]:
@@ -1649,8 +1680,11 @@ def main():
             result = st.session_state.opt_result
             vis = FPVDroneVisualizer()
             fig = vis.plot_convergence(result['history'])
-            st.pyplot(fig)
-            plt.close(fig)
+            if fig is FAILED:
+                st.error("Convergence plot failed - see app logs.")
+            else:
+                st.pyplot(fig)
+                plt.close(fig)
             # History table
             st.subheader("Iteration history")
             hist_data = []
