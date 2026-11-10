@@ -1,0 +1,7 @@
+libgl1
+libglu1-mesa
+libxrender1
+libxext6
+libsm6
+libx11-6
+libgomp1
