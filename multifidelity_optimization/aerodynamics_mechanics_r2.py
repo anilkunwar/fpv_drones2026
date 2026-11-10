@@ -1002,7 +1002,6 @@ class FPVDrone3DMeshGenerator:
         return xs, ys
 
     @staticmethod
-    @handle_errors
     def generate_mesh(design, drone_class, output_prefix="fpv_3d_mesh",
                        finesse="coarse"):
         """Builds the 3D geometry and meshes it.
@@ -1050,8 +1049,29 @@ class FPVDrone3DMeshGenerator:
         # gmsh.finalize() ALWAYS runs, even if meshing fails midway.
         # Without this, a failed mesh leaves gmsh initialized and the next
         # call to gmsh.initialize() raises "gmsh is already initialized".
+
+        # =========================================================================
+        # WORKAROUND: gmsh tries to register signal handlers on initialize(),
+        # which raises "ValueError: signal only works in main thread" in
+        # Streamlit/Jupyter. We temporarily monkey-patch signal.signal to
+        # ignore the registration, and restore the original immediately after.
+        # =========================================================================
+        import signal
+        _orig_signal = signal.signal
+
+        def _dummy_signal(signum, handler):
+            pass
+
+        signal.signal = _dummy_signal
+
         try:
             gmsh.initialize()
+        finally:
+            # Immediately restore the original signal handler
+            signal.signal = _orig_signal
+        # =========================================================================
+
+        try:
             gmsh.model.add("fpv_quad_3d")
             occ = gmsh.model.occ
 
