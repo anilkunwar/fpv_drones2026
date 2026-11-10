@@ -976,19 +976,19 @@ class FPVDrone3DMeshGenerator:
     # --- NACA 4-digit airfoil generator (closed trailing edge) ---
     @staticmethod
     def _naca4(m, p, t, n=61):
-        """Closed trailing-edge NACA 4-digit airfoil loop.
-
-        Parameters: m = max camber fraction, p = camber position,
-                   t = thickness fraction, n = points per surface.
-        Returns (xs, ys) arrays for the full closed loop (upper then lower
-        reversed), excluding the duplicated trailing-edge point.
+        """Returns xu, yu, xl, yl arrays for a NACA 4-digit airfoil.
+        Index 0 corresponds to the Leading Edge (x=0).
+        Index -1 corresponds to the Trailing Edge (x=1).
+        Uses the -0.1036 coefficient for an exact closed trailing edge.
         """
         beta = np.linspace(0.0, np.pi, n)
         x = 0.5 * (1.0 - np.cos(beta))
-        # Thickness distribution (closed TE: -0.1015 coefficient)
+        # =========================================================================
+        # FIX: Use -0.1036 (not -0.1015) to ensure yt=0 exactly at x=1 (TE).
+        # This guarantees the upper and lower surfaces meet perfectly at the TE.
+        # =========================================================================
         yt = 5.0 * t * (0.2969 * np.sqrt(x) - 0.1260 * x
-                        - 0.3516 * x**2 + 0.2843 * x**3 - 0.1015 * x**4)
-        # Camber line
+                        - 0.3516 * x**2 + 0.2843 * x**3 - 0.1036 * x**4)
         yc = np.where(x < p, m / p**2 * (2 * p * x - x**2),
                       m / (1 - p)**2 * ((1 - 2 * p) + 2 * p * x - x**2))
         dyc = np.where(x < p, 2 * m / p**2 * (p - x),
@@ -996,10 +996,7 @@ class FPVDrone3DMeshGenerator:
         th = np.arctan(dyc)
         xu, yu = x - yt * np.sin(th), yc + yt * np.cos(th)
         xl, yl = x + yt * np.sin(th), yc - yt * np.cos(th)
-        # Concatenate upper then lower (reversed, excluding endpoints)
-        xs = np.concatenate([xu, xl[-2:0:-1]])
-        ys = np.concatenate([yu, yl[-2:0:-1]])
-        return xs, ys
+        return xu, yu, xl, yl
 
     @staticmethod
     def generate_mesh(design, drone_class, output_prefix="fpv_3d_mesh",
@@ -1077,21 +1074,20 @@ class FPVDrone3DMeshGenerator:
 
             # --- 1. Build one representative 3D blade per arm ---
             # NACA 4412: m=0.04, p=0.4, t=0.12
-            xs, ys = FPVDrone3DMeshGenerator._naca4(0.04, 0.4, 0.12)
+            xu, yu, xl, yl = FPVDrone3DMeshGenerator._naca4(0.04, 0.4, 0.12)
+
             # Spanwise stations (fraction of R) where airfoil sections are
             # placed.  Clustered near tip to resolve tip vortex.
             r_fracs = (0.15, 0.35, 0.60, 0.80, 0.95, 0.995)
-
             all_blade_vols = []
-
             for arm_idx in range(n_arms):
                 arm_angle = (arm_idx + 0.5) * 2 * np.pi / n_arms
                 mx = arm_L * np.cos(arm_angle)
                 my = arm_L * np.sin(arm_angle)
+
                 # Blade span direction (radially outward from motor)
                 ur = np.array([np.cos(arm_angle), np.sin(arm_angle), 0.0])
                 zax = np.array([0.0, 0.0, 1.0])
-
                 wires = []
                 for rf in r_fracs:
                     r = rf * R
@@ -1102,23 +1098,35 @@ class FPVDrone3DMeshGenerator:
                     # Chord direction (rotated by twist)
                     e_chord = np.cos(beta) * ur + np.sin(beta) * zax
                     e_thick = -np.sin(beta) * ur + np.cos(beta) * zax
-                    pts = []
-                    for x, y in zip(xs, ys):
+
+                    # =========================================================================
+                    # FIX: Build the airfoil wire using TWO separate splines (upper and lower)
+                    # to avoid self-intersection at the sharp leading edge.
+                    # Upper spline: Trailing Edge (index -1) -> Leading Edge (index 0)
+                    # Lower spline: Leading Edge (index 0) -> Trailing Edge (index -1)
+                    # =========================================================================
+                    pts_upper = []
+                    for x, y in zip(xu[::-1], yu[::-1]):
                         p = (np.array([mx, my, 0.0]) + r * ur
                              + (x - 0.25) * c * e_chord
                              + y * c * e_thick)
-                        pts.append(occ.addPoint(
+                        pts_upper.append(occ.addPoint(
                             float(p[0]), float(p[1]), float(p[2])))
-                    # =========================================================================
-                    # FIX: OpenCASCADE's addBSpline fails when the first and last
-                    # points are identical (which happens if you append pts[0] to
-                    # close the loop). The robust approach is to use addSpline
-                    # (cubic spline) for the open profile, and explicitly close
-                    # the wire with a line segment at the trailing edge.
-                    # =========================================================================
-                    spl = occ.addSpline(pts)
-                    line_close = occ.addLine(pts[-1], pts[0])
-                    cl = occ.addCurveLoop([spl, line_close])
+
+                    pts_lower = []
+                    for x, y in zip(xl, yl):
+                        p = (np.array([mx, my, 0.0]) + r * ur
+                             + (x - 0.25) * c * e_chord
+                             + y * c * e_thick)
+                        pts_lower.append(occ.addPoint(
+                            float(p[0]), float(p[1]), float(p[2])))
+
+                    spl_upper = occ.addSpline(pts_upper)
+                    spl_lower = occ.addSpline(pts_lower)
+
+                    # Because xu[0]==xl[0] (TE) and xu[-1]==xl[-1] (LE),
+                    # the curve loop is perfectly closed without needing a line segment.
+                    cl = occ.addCurveLoop([spl_upper, spl_lower])
                     wires.append(occ.addWire([cl]))
                     # =========================================================================
 
