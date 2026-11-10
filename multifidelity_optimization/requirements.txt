@@ -10,6 +10,9 @@ h5py
 #torch              # optional
 pillow             # for GIF animation
 imageio-ffmpeg     # for MP4 animation
+smt
+gmsh
+pyvista
 cupy-cuda12x  # For CUDA 11.x pip install cupy-cuda11x
 imageio
 imageio-ffmpeg
