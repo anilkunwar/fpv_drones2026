@@ -1100,34 +1100,53 @@ class FPVDrone3DMeshGenerator:
                     e_thick = -np.sin(beta) * ur + np.cos(beta) * zax
 
                     # =========================================================================
-                    # FIX: Build the airfoil wire using TWO separate splines (upper and lower)
-                    # to avoid self-intersection at the sharp leading edge.
-                    # Upper spline: Trailing Edge (index -1) -> Leading Edge (index 0)
-                    # Lower spline: Leading Edge (index 0) -> Trailing Edge (index -1)
+                    # FIX: Build the airfoil wire using TWO separate splines (upper and
+                    # lower) to avoid self-intersection at the sharp leading edge.
+                    #   Upper spline: Trailing Edge (xu[-1]) -> Leading Edge (xu[0])
+                    #   Lower spline: Leading Edge (xl[0])  -> Trailing Edge (xl[-1])
+                    #
+                    # CRITICAL (root cause of "Making solid requires closed wires"):
+                    # addThruSections(makeSolid=True) runs OpenCASCADE's strict BRep
+                    # topology check and rejects any wire whose junction points are
+                    # only *geometrically* identical but *topologically* distinct.
+                    # Calling occ.addPoint twice at the shared LE/TE location creates
+                    # two separate OCC vertices, so the wire is topologically OPEN
+                    # even though the coordinates match to machine epsilon.
+                    #
+                    # Solution: build the upper point list first, then REUSE the
+                    # actual point TAGS (pts_upper[0] = TE, pts_upper[-1] = LE) as
+                    # the endpoints of the lower spline, so each junction is a
+                    # single shared OCC vertex and the curve loop is topologically
+                    # closed. We also pass the curve-loop tag directly to
+                    # addThruSections (the canonical gmsh t19 pattern) instead of
+                    # wrapping it in addWire, which is documented to produce an
+                    # "open or closed" wire and is not what makeSolid expects.
                     # =========================================================================
-                    pts_upper = []
-                    for x, y in zip(xu[::-1], yu[::-1]):
+                    def _pt(x, y):
                         p = (np.array([mx, my, 0.0]) + r * ur
                              + (x - 0.25) * c * e_chord
                              + y * c * e_thick)
-                        pts_upper.append(occ.addPoint(
-                            float(p[0]), float(p[1]), float(p[2])))
+                        return occ.addPoint(float(p[0]), float(p[1]),
+                                            float(p[2]))
 
-                    pts_lower = []
-                    for x, y in zip(xl, yl):
-                        p = (np.array([mx, my, 0.0]) + r * ur
-                             + (x - 0.25) * c * e_chord
-                             + y * c * e_thick)
-                        pts_lower.append(occ.addPoint(
-                            float(p[0]), float(p[1]), float(p[2])))
+                    # Upper surface: TE -> LE  (reversed xu/yu)
+                    pts_upper = [_pt(x, y) for x, y in zip(xu[::-1], yu[::-1])]
+                    tag_te = pts_upper[0]      # shared TE vertex
+                    tag_le = pts_upper[-1]     # shared LE vertex
+
+                    # Lower surface: LE -> TE, reusing the shared junction tags.
+                    # xl[0]/yl[0] is the LE, xl[-1]/yl[-1] is the TE; the interior
+                    # points (indices 1..-2) get fresh addPoint calls.
+                    pts_lower = [tag_le]
+                    for x, y in zip(xl[1:-1], yl[1:-1]):
+                        pts_lower.append(_pt(x, y))
+                    pts_lower.append(tag_te)
 
                     spl_upper = occ.addSpline(pts_upper)
                     spl_lower = occ.addSpline(pts_lower)
 
-                    # Because xu[0]==xl[0] (TE) and xu[-1]==xl[-1] (LE),
-                    # the curve loop is perfectly closed without needing a line segment.
                     cl = occ.addCurveLoop([spl_upper, spl_lower])
-                    wires.append(occ.addWire([cl]))
+                    wires.append(cl)   # curve-loop tag, per gmsh t19
                     # =========================================================================
 
                 # Loft a solid through the airfoil sections
