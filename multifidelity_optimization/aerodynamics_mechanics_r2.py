@@ -1109,10 +1109,18 @@ class FPVDrone3DMeshGenerator:
                              + y * c * e_thick)
                         pts.append(occ.addPoint(
                             float(p[0]), float(p[1]), float(p[2])))
-                    pts.append(pts[0])  # close the loop
-                    spl = occ.addBSpline(pts)
-                    cl = occ.addCurveLoop([spl])
+                    # =========================================================================
+                    # FIX: OpenCASCADE's addBSpline fails when the first and last
+                    # points are identical (which happens if you append pts[0] to
+                    # close the loop). The robust approach is to use addSpline
+                    # (cubic spline) for the open profile, and explicitly close
+                    # the wire with a line segment at the trailing edge.
+                    # =========================================================================
+                    spl = occ.addSpline(pts)
+                    line_close = occ.addLine(pts[-1], pts[0])
+                    cl = occ.addCurveLoop([spl, line_close])
                     wires.append(occ.addWire([cl]))
+                    # =========================================================================
 
                 # Loft a solid through the airfoil sections
                 blade_vol = occ.addThruSections(wires, makeSolid=True)
