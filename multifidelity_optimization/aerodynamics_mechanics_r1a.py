@@ -359,16 +359,16 @@ class GeometryViewSettings:
 @dataclass
 class MeshSettings:
     """VLM / mid-fidelity mesh and solver-level tunables."""
-    n_panels_per_prop: int = 16            # was 8; 16+ needed for converged CDi
-    vortex_core_radius: float = 0.05        # Lamb-Oseen core, [m]
+    n_panels_per_prop: int = 20            # bumped from 8->16->20 for convergence
+    vortex_core_radius: float = 0.05        # Lamb-Oseen core [m], regularizes 1/r singularity
     horseshoe_length_factor: float = 50.0   # trailing-leg length = factor * chord
-    r_root_fraction: float = 0.10           # blade root radius = frac * prop_R
+    r_root_fraction: float = 0.15           # blade root radius = frac * prop_R (was 0.10)
     chord_root_fraction: float = 0.15       # root chord = frac * pitch
     chord_tip_fraction: float = 0.05        # tip chord = frac * pitch
     blade_count_for_viz: int = 1            # blades drawn per prop (VLM uses 1 lifting line)
-    n_helix_segments: int = 5              # trailing-leg helical discretisation
-                                           # 1 = simplified single-segment helix
-                                           # 5+ = proper curved helical wake
+    n_helix_segments: int = 8              # bumped from 5->8 for smooth helical wake
+    panel_spacing: str = 'cosine'           # 'uniform' or 'cosine' (clusters near tip)
+    wake_contraction: float = 0.15         # 0.0 = none, 0.15 = 15% radial contraction
 
 
 @dataclass
@@ -551,12 +551,23 @@ class FPVDroneGeometry:
         for cruise, so a forward AOA tilts the disks slightly.
     """
 
-    def __init__(self, design, drone_class='FPV 5"', n_panels_per_prop=8):
+    def __init__(self, design, drone_class='FPV 5"', n_panels_per_prop=8,
+                 mesh_settings=None):
         self.design = design
         self.drone_class = drone_class
         self.spec = DroneGeometryProperties.get(drone_class)
         self.n_arms = int(self.spec['n_arms'])
         self.n_panels_per_prop = int(n_panels_per_prop)
+        # Pull mesh-related geometry parameters from MeshSettings if provided,
+        # otherwise use the legacy defaults (r_root=0.10, uniform spacing).
+        if mesh_settings is not None:
+            self.r_root_fraction = float(mesh_settings.r_root_fraction)
+            self.panel_spacing = str(mesh_settings.panel_spacing)
+            self.wake_contraction = float(mesh_settings.wake_contraction)
+        else:
+            self.r_root_fraction = 0.10
+            self.panel_spacing = 'uniform'
+            self.wake_contraction = 0.0
         self._build()
 
     @handle_errors
@@ -585,9 +596,17 @@ class FPVDroneGeometry:
         for i in range(n_arms):
             cx, cy, cz = motor_xy[i]
             # blade spanwise stations
-            r_root = 0.10 * prop_R
+            r_root = self.r_root_fraction * prop_R
             r_tip = prop_R
-            r = np.linspace(r_root, r_tip, n_pan + 1)
+            # Panel spacing: 'cosine' clusters panels near both root and tip
+            # (standard VLM practice for tip-vortex resolution), 'uniform'
+            # uses equal spacing.
+            if self.panel_spacing == 'cosine':
+                theta = np.linspace(0.0, np.pi, n_pan + 1)
+                r = 0.5 * (r_tip + r_root) \
+                    - 0.5 * (r_tip - r_root) * np.cos(theta)
+            else:
+                r = np.linspace(r_root, r_tip, n_pan + 1)
             # quarter-chord line of the blade (in the disk plane)
             # Pitch twist: geometric pitch -> local AOA varies along span
             pitch = float(d['prop_pitch'])
@@ -873,14 +892,23 @@ class FPVDroneGeometry:
                 t_total = Lvis / V_inf
                 n_seg = max(1, ms.n_helix_segments)
                 taus = np.linspace(0.0, t_total, n_seg + 1)
+                # Wake contraction (matches solver's _helical_leg_induced_velocity)
+                k_contract = ms.wake_contraction
+                if k_contract > 0.0 and t_total > 0.0:
+                    contract_factor = 1.0 - k_contract * (
+                        1.0 - np.exp(-3.0 * taus / t_total))
+                else:
+                    contract_factor = np.ones_like(taus)
                 for r_blade in [r1, r2]:
+                    r_eff = r_blade * contract_factor
                     angles = th - omega * taus
-                    xs = mx + r_blade * np.cos(angles) + V_inf * taus
-                    ys = my + r_blade * np.sin(angles)
+                    xs = mx + r_eff * np.cos(angles) + V_inf * taus
+                    ys = my + r_eff * np.sin(angles)
                     ax.plot(xs, ys, '-',
                             color=vs.color_trailing_vortex, lw=vs.lw_trailing,
                             alpha=0.6,
-                            label='Trailing vortex (helical)' if (i == 0 and j == 0) else None)
+                            label='Trailing vortex (helical + contraction)'
+                            if (i == 0 and j == 0) else None)
                 # Control point at 3/4-chord
                 cp = pp['control_pts'][j]
                 ax.plot(cp[0], cp[1], marker='o',
@@ -939,9 +967,18 @@ class SpectralVLMSolver:
         ms = mesh_settings if mesh_settings is not None else DEFAULT_MESH_SETTINGS
         self.horseshoe_length_factor = float(ms.horseshoe_length_factor)
         # Helical wake discretisation: n_helix_segments = 1 gives the
-        # simplified single-segment helical offset (user's proposed fix);
-        # n_helix_segments >= 5 gives a proper curved helical polyline.
+        # simplified single-segment helical offset; n_helix_segments >= 5
+        # gives a proper curved helical polyline.
         self.n_helix_segments = int(ms.n_helix_segments)
+        # Lamb-Oseen vortex core radius: regularizes the 1/r singularity in
+        # Biot-Savart when control points are close to vortex filaments.
+        # rc=0 disables regularization (point-vortex); rc>0 applies the
+        # standard (1 - exp(-r²/rc²)) damping factor.
+        self.vortex_core_radius = float(ms.vortex_core_radius)
+        # Wake contraction: the helix radius decreases as the wake convects
+        # downstream, asymptoting to (1-wake_contraction)*r.  This models
+        # the pressure-driven contraction of real propeller wakes.
+        self.wake_contraction = float(ms.wake_contraction)
         # Build linear system once (geometry doesn't change during a solve)
         self._build_influence_matrix()
 
@@ -960,13 +997,22 @@ class SpectralVLMSolver:
             cp = ppi['control_pts'][ji]
             for j, (ppj, jj) in enumerate(panels):
                 if i == j:
-                    # self-induced downwash of a horseshoe on its own CP
-                    # ~ 1 / (4 * pi * chord) approximation
-                    chord = ppj['chord'][jj]
-                    A[i, j] = 1.0 / (4.0 * np.pi * max(chord, 1e-4))
+                    # Self-induced downwash: use the same horseshoe formula
+                    # but with the Lamb-Oseen core active.  The old
+                    # 1/(4*pi*chord) approximation was too crude and caused
+                    # the influence matrix to be ill-conditioned at high
+                    # panel counts (adjacent CPs get very close to each
+                    # other's bound vortices).  Computing the self-influence
+                    # via the actual Biot-Savart with core regularization
+                    # gives a well-conditioned matrix.
+                    A[i, j] = self._horseshoe_induced_downwash(
+                        ppj, jj, cp)
                 else:
                     A[i, j] = self._horseshoe_induced_downwash(
                         ppj, jj, cp)
+        # Add a small diagonal regularization to ensure the matrix is
+        # well-conditioned even when the geometry is degenerate.
+        A += 1e-8 * np.eye(N)
         self.A = A
         self.panels = panels
         self.N = N
@@ -1029,38 +1075,64 @@ class SpectralVLMSolver:
         vortex leg shed from blade point (mx + r*cos(th), my + r*sin(th), 0).
 
         The helix is discretised into n_seg straight Biot-Savart segments.
+        Wake contraction is applied: the effective helix radius decreases
+        as the wake convects downstream, asymptoting to
+        (1 - wake_contraction) * r at tau = t_total.
         """
         V_inf = max(self.freestream_speed, 1.0)
         omega = self.omega
         # Generate the helix points: tau from 0 to t_total
         taus = np.linspace(0.0, t_total, n_seg + 1)
+        # Wake contraction: r_eff(tau) = r * (1 - k * (1 - exp(-3*tau/t_total)))
+        # At tau=0: r_eff = r (no contraction at the blade).
+        # At tau=t_total: r_eff ≈ r * (1 - k * 0.95) ≈ r * (1 - k).
+        # The factor 3 in the exponent gives fast contraction (95% of the
+        # way to the asymptotic value by tau = t_total).
+        k = self.wake_contraction
+        if k > 0.0 and t_total > 0.0:
+            r_eff = r * (1.0 - k * (1.0 - np.exp(-3.0 * taus / t_total)))
+        else:
+            r_eff = np.full_like(taus, r)
         # Pre-compute all helix points
         angles = th - omega * taus          # angular position at each tau
-        xs = mx + r * np.cos(angles) + V_inf * taus
-        ys = my + r * np.sin(angles)
+        xs = mx + r_eff * np.cos(angles) + V_inf * taus
+        ys = my + r_eff * np.sin(angles)
         zs = np.zeros(n_seg + 1)
         pts = np.column_stack([xs, ys, zs])
         # Sum Biot-Savart over each straight segment
         w_total = np.zeros(3)
-        for k in range(n_seg):
-            w_total += self._biot_savart_segment(pts[k], pts[k + 1], cp)
+        for k_seg in range(n_seg):
+            w_total += self._biot_savart_segment(pts[k_seg], pts[k_seg + 1], cp)
         return w_total
 
-    @staticmethod
-    def _biot_savart_segment(p1, p2, cp):
+    def _biot_savart_segment(self, p1, p2, cp):
         """Biot-Savart induced velocity at cp from a unit-strength straight
-        vortex segment from p1 to p2.  Returns the 3-vector w."""
+        vortex segment from p1 to p2.  Returns the 3-vector w.
+
+        Applies Lamb-Oseen vortex-core regularization when
+        self.vortex_core_radius > 0: the 1/r_perp singularity is replaced
+        by (1 - exp(-r_perp²/rc²)) / r_perp, which goes to zero as
+        r_perp → 0 instead of blowing up.  This prevents numerical
+        instabilities when control points are close to vortex filaments
+        (e.g. wake overlap between adjacent rotors)."""
         r1 = cp - p1
         r2 = cp - p2
         L = p2 - p1
         cross = np.cross(L, r1)
-        denom = np.linalg.norm(cross) ** 2 + 1e-12
-        # Standard finite-segment Biot-Savart factor:
-        # w = (Gamma / (4*pi)) * (r1 + r2) x (r2 - r1) / |r1 x L|^2 ... (simplified)
+        cross_norm_sq = float(np.linalg.norm(cross) ** 2) + 1e-12
+        L_norm_sq = float(np.linalg.norm(L) ** 2) + 1e-12
+        # Perpendicular distance from cp to the vortex line
+        r_perp_sq = cross_norm_sq / L_norm_sq
         r1n = np.linalg.norm(r1) + 1e-12
         r2n = np.linalg.norm(r2) + 1e-12
         factor = (np.dot(r1, L) / r1n - np.dot(r2, L) / r2n)
-        w = factor * cross / denom / (4.0 * np.pi)
+        # Lamb-Oseen core regularization factor
+        rc = self.vortex_core_radius
+        if rc > 0.0:
+            core_factor = 1.0 - np.exp(-r_perp_sq / (rc * rc))
+        else:
+            core_factor = 1.0
+        w = factor * cross / cross_norm_sq * core_factor / (4.0 * np.pi)
         return w
 
     # ------------------------------------------------------------------
@@ -1100,9 +1172,23 @@ class SpectralVLMSolver:
             # Project onto panel-normal direction (z-component for small beta)
             rhs[i] = V_eff * np.sin(alpha_eff)
 
-        # Solve for Gamma
+        # Solve for Gamma using a regularized least-squares approach.
+        # The influence matrix A can be ill-conditioned (especially at high
+        # panel counts where adjacent CPs get close to each other's bound
+        # vortices), so we use Tikhonov regularization: minimize
+        #   ||A*gamma - rhs||^2 + lambda*||gamma||^2
+        # The lambda is scaled by the largest diagonal entry of A'A so
+        # that the regularization is relative to the matrix's natural
+        # scale (not an absolute constant that would over- or under-
+        # regularize at different panel counts).
         try:
-            gamma = np.linalg.solve(self.A + 1e-6 * np.eye(self.N), rhs)
+            ATA = self.A.T @ self.A
+            ATb = self.A.T @ rhs
+            # Scale lambda by the trace of ATA so it's relative
+            scale = max(np.trace(ATA) / max(self.N, 1), 1e-12)
+            lambda_reg = 1e-3 * scale
+            gamma = np.linalg.solve(
+                ATA + lambda_reg * np.eye(self.N), ATb)
         except np.linalg.LinAlgError:
             gamma = np.linalg.lstsq(self.A, rhs, rcond=None)[0]
 
@@ -1283,7 +1369,8 @@ class HighFidelityHook:
         """
         ms = mesh_settings if mesh_settings is not None else DEFAULT_MESH_SETTINGS
         geom = FPVDroneGeometry(design, drone_class,
-                                 n_panels_per_prop=ms.n_panels_per_prop)
+                                 n_panels_per_prop=ms.n_panels_per_prop,
+                                 mesh_settings=ms)
         vlm = SpectralVLMSolver(geom, design, mesh_settings=ms).solve()
         mid = MidFidelityCorrector(
             vortex_core_radius=ms.vortex_core_radius
@@ -1550,7 +1637,8 @@ class VariableFidelityOptimizer:
         if errors:
             return None
         geom = FPVDroneGeometry(design, self.drone_class,
-                                 n_panels_per_prop=self.mesh_settings.n_panels_per_prop)
+                                 n_panels_per_prop=self.mesh_settings.n_panels_per_prop,
+                                 mesh_settings=self.mesh_settings)
         vlm = SpectralVLMSolver(geom, design,
                                  mesh_settings=self.mesh_settings).solve()
         mid = MidFidelityCorrector(
@@ -2115,215 +2203,158 @@ def main():
         for w in warns:
             st.warning(w)
         # NOTE: All customization controls (figure / geometry / mesh / surrogate)
-        # have been moved to the "⚙️ Settings" tab in the main area.  This
-        # avoids the fragile pattern of defining dataclass instances deep
-        # inside a collapsed sidebar expander where they can silently fall
-        # back to defaults on certain rerun orderings.  The Settings tab
-        # renders FIRST (before all consumer tabs) so its widget values are
-        # always up-to-date when the Geometry / Mesh / Optimise / Surrogate
-        # tabs read them.
+        # are placed inline in expanders above their corresponding plots in
+        # each tab (Geometry, Mesh, Surrogate, Convergence).  Settings are
+        # rebuilt from st.session_state at the top of the main area, before
+        # any tab renders, so every tab sees the latest values.
 
     # ==============================================================
     # MAIN AREA
     # ==============================================================
-    # Settings tab is FIRST so its widgets render before any consumer tab,
-    # eliminating the one-rerun lag where consumer tabs would see stale
-    # settings on the same rerun that a setting was changed.
-    tabs = st.tabs(["⚙️ Settings", "Geometry", "Mesh", "Single Eval",
+    # Customization controls are placed inline in expanders above their
+    # corresponding plots (per user request).  Streamlit stores widget
+    # values in st.session_state[key] immediately after the widget renders,
+    # and these persist across reruns.  We rebuild the four settings
+    # dataclasses HERE (before any tab renders) using st.session_state.get()
+    # so that every tab sees the latest values.  On the very first run,
+    # the keys don't exist yet and the .get() falls back to defaults.
+    tabs = st.tabs(["Geometry", "Mesh", "Single Eval",
                     "Optimise", "Surrogate", "Convergence", "Export"])
+    cmap_options = ColormapRegistry.list_all()
 
-    # ----- ⚙️ Settings tab (FIRST — interactive, replaces read-only JSON) -----
-    with tabs[0]:
-        st.header("⚙️ Aerodynamic & Visualization Settings")
-        st.caption("Adjust VLM mesh, helical wake, surrogate model, and "
-                   "figure appearance.  Changes take effect immediately "
-                   "in all other tabs.")
-        cmap_options = ColormapRegistry.list_all()
+    # ---- Rebuild settings from session_state (survives across reruns) ----
+    # Each .get(key, default) returns the widget's current value if the
+    # widget has rendered at least once, otherwise the default.
+    _ms_panels = st.session_state.get('ms_panels', DEFAULT_MESH_SETTINGS.n_panels_per_prop)
+    _ms_helix  = st.session_state.get('ms_helix', DEFAULT_MESH_SETTINGS.n_helix_segments)
+    _ms_core   = st.session_state.get('ms_core', DEFAULT_MESH_SETTINGS.vortex_core_radius)
+    _ms_shoe   = st.session_state.get('ms_shoe', DEFAULT_MESH_SETTINGS.horseshoe_length_factor)
+    _ms_spacing = st.session_state.get('ms_spacing', DEFAULT_MESH_SETTINGS.panel_spacing)
+    _ms_wake   = st.session_state.get('ms_wake_cont', DEFAULT_MESH_SETTINGS.wake_contraction)
+    mesh_settings = MeshSettings(
+        n_panels_per_prop=_ms_panels,
+        vortex_core_radius=_ms_core,
+        horseshoe_length_factor=_ms_shoe,
+        n_helix_segments=_ms_helix,
+        panel_spacing=_ms_spacing,
+        wake_contraction=_ms_wake)
 
-        # ---------- Mesh / VLM settings ----------
-        st.subheader("Mesh & VLM Solver")
-        st.caption("These parameters control the vortex-lattice discretisation "
-                   "and the helical wake model.  **Blade count** is read from "
-                   "the sidebar's single-design evaluator.")
-        col_m1, col_m2, col_m3 = st.columns(3)
-        with col_m1:
-            n_panels = st.slider("Panels per propeller blade", 4, 24, 16, 1,
-                                   key="ms_panels",
-                                   help="VLM typically requires 15-20+ panels "
-                                        "for converged induced drag.")
-            n_helix  = st.slider("Helical wake segments", 1, 15, 5, 1,
-                                   key="ms_helix",
-                                   help="Trailing-vortex helix discretisation. "
-                                        "1 = simplified single-segment helix; "
-                                        "5+ = proper curved helical wake.")
-        with col_m2:
-            core_rad = st.slider("Lamb-Oseen core r (m)", 0.005, 0.20, 0.05,
-                                   0.005, key="ms_core")
-            shoe_fac = st.slider("Horseshoe length (× chord)", 10.0, 200.0,
-                                   50.0, 5.0, key="ms_shoe")
-        with col_m3:
-            st.metric("Default panels", DEFAULT_MESH_SETTINGS.n_panels_per_prop)
-            st.metric("Helical wake", "ON" if n_helix > 1 else "simplified")
+    _ss_backend = st.session_state.get('ss_backend', DEFAULT_SURR_SETTINGS.backend)
+    _ss_corr    = st.session_state.get('ss_corr', DEFAULT_SURR_SETTINGS.corr)
+    _ss_poly    = st.session_state.get('ss_poly', DEFAULT_SURR_SETTINGS.poly)
+    _ss_theta0  = st.session_state.get('ss_theta0', DEFAULT_SURR_SETTINGS.theta0)
+    _ss_nugget  = st.session_state.get('ss_nugget', DEFAULT_SURR_SETTINGS.nugget)
+    _ss_sweep_x = st.session_state.get('ss_sweep_x', (0, SurrogateSettings.DIM_NAMES[0]))
+    _ss_sweep_y = st.session_state.get('ss_sweep_y', (1, SurrogateSettings.DIM_NAMES[1]))
+    _ss_ngrid   = st.session_state.get('ss_ngrid', DEFAULT_SURR_SETTINGS.n_grid)
+    _ss_nlev    = st.session_state.get('ss_nlev', DEFAULT_SURR_SETTINGS.n_levels)
+    _ss_show_lo = st.session_state.get('ss_show_lo', DEFAULT_SURR_SETTINGS.show_low_fidelity_points)
+    _ss_show_hi = st.session_state.get('ss_show_hi', DEFAULT_SURR_SETTINGS.show_high_fidelity_points)
+    _ss_unc     = st.session_state.get('ss_unc', DEFAULT_SURR_SETTINGS.show_uncertainty_band)
+    _ss_cmap    = st.session_state.get('ss_cmap', DEFAULT_SURR_SETTINGS.colormap)
+    surrogate_settings = SurrogateSettings(
+        backend=_ss_backend, corr=_ss_corr, poly=_ss_poly,
+        theta0=float(_ss_theta0), nugget=float(_ss_nugget),
+        sweep_var_x=int(_ss_sweep_x[0]) if isinstance(_ss_sweep_x, tuple) else int(_ss_sweep_x),
+        sweep_var_y=int(_ss_sweep_y[0]) if isinstance(_ss_sweep_y, tuple) else int(_ss_sweep_y),
+        n_grid=_ss_ngrid, n_levels=_ss_nlev,
+        show_low_fidelity_points=_ss_show_lo,
+        show_high_fidelity_points=_ss_show_hi,
+        show_uncertainty_band=_ss_unc,
+        colormap=_ss_cmap)
 
-        st.markdown("---")
-        # ---------- Surrogate settings ----------
-        st.subheader("Cokriging Surrogate")
-        smt_status = "✅ available" if SMT_AVAILABLE else "❌ not installed"
-        st.caption(f"_smt package: **{smt_status}**_")
-        col_s1, col_s2 = st.columns(2)
-        with col_s1:
-            backend = st.selectbox("Backend", ['auto', 'smt', 'numpy'],
-                                     index=0, key="ss_backend")
-            corr    = st.selectbox("Correlation kernel (SMT only)",
-                                     ['squar_exp', 'abs_exp', 'matern32'],
-                                     index=0, key="ss_corr")
-            poly    = st.selectbox("Polynomial basis (SMT only)",
-                                     ['constant', 'linear'],
-                                     index=0, key="ss_poly")
-            theta0  = st.number_input("theta0 (hyperparameter)",
-                                        value=1e-2, format="%.2e",
-                                        step=1e-3, key="ss_theta0")
-            nugget  = st.number_input("Nugget (regularization)",
-                                        value=1e-8, format="%.2e",
-                                        step=1e-9, key="ss_nugget")
-        with col_s2:
-            st.markdown("**Response-surface plotting**")
-            dim_pairs = list(enumerate(SurrogateSettings.DIM_NAMES))
-            sweep_x = st.selectbox("Sweep variable (X axis)", dim_pairs,
-                                     format_func=lambda x: x[1], index=0,
-                                     key="ss_sweep_x")
-            sweep_y = st.selectbox("Sweep variable (Y axis)", dim_pairs,
-                                     format_func=lambda x: x[1], index=1,
-                                     key="ss_sweep_y")
-            n_grid  = st.slider("Grid resolution", 10, 80, 30, 5,
-                                   key="ss_ngrid")
-            n_lev   = st.slider("Contour levels", 5, 40, 20, 1, key="ss_nlev")
-            show_lo = st.checkbox("Show low-fidelity samples", True,
-                                     key="ss_show_lo")
-            show_hi = st.checkbox("Show high-fidelity samples", True,
-                                     key="ss_show_hi")
-            show_unc = st.checkbox("Overlay ±σ uncertainty band", False,
-                                     key="ss_unc")
-            surr_cmap = st.selectbox("Response-surface colormap",
-                                        cmap_options,
-                                        index=cmap_options.index('ld'),
-                                        key="ss_cmap")
+    _fs_w   = st.session_state.get('fig_w', DEFAULT_FIG_SETTINGS.figsize[0])
+    _fs_h   = st.session_state.get('fig_h', DEFAULT_FIG_SETTINGS.figsize[1])
+    _fs_dpi = st.session_state.get('fig_dpi', DEFAULT_FIG_SETTINGS.dpi)
+    _fs_fs  = st.session_state.get('fs_font', DEFAULT_FIG_SETTINGS.font_size)
+    _fs_leg = st.session_state.get('fs_leg', DEFAULT_FIG_SETTINGS.legend_size)
+    _fs_cmap_ld = st.session_state.get('fs_cmap_ld', DEFAULT_FIG_SETTINGS.colormap_ld)
+    _fs_cmap_vort = st.session_state.get('fs_cmap_vort', DEFAULT_FIG_SETTINGS.colormap_vort)
+    _fs_cb  = st.session_state.get('fs_cb', DEFAULT_FIG_SETTINGS.show_colorbar)
+    _fs_grid = st.session_state.get('fs_grid', DEFAULT_FIG_SETTINGS.show_grid)
+    _fs_galpha = st.session_state.get('fs_galpha', DEFAULT_FIG_SETTINGS.grid_alpha)
+    _fs_invert = st.session_state.get('fs_invert', DEFAULT_FIG_SETTINGS.invert_colormap)
+    fig_settings = FigureSettings(
+        figsize=(_fs_w, _fs_h), dpi=_fs_dpi,
+        font_size=_fs_fs, legend_size=_fs_leg,
+        colormap_ld=_fs_cmap_ld, colormap_vort=_fs_cmap_vort,
+        show_colorbar=_fs_cb, show_grid=_fs_grid,
+        grid_alpha=_fs_galpha, invert_colormap=_fs_invert)
 
-        st.markdown("---")
-        # ---------- Figure settings ----------
-        st.subheader("Figure Appearance")
-        col_f1, col_f2 = st.columns(2)
-        with col_f1:
-            fig_width  = st.slider("Figure width (in)", 4, 16, 8, 1,
-                                     key="fig_w")
-            fig_height = st.slider("Figure height (in)", 3, 12, 6, 1,
-                                     key="fig_h")
-            fig_dpi    = st.slider("DPI", 60, 200, 100, 10, key="fig_dpi")
-            font_size  = st.slider("Font size", 6, 18, 10, 1, key="fs_font")
-            legend_sz  = st.slider("Legend size", 6, 14, 8, 1, key="fs_leg")
-        with col_f2:
-            cmap_ld   = st.selectbox("Colormap (L/D)", cmap_options,
-                                       index=cmap_options.index('ld'),
-                                       key="fs_cmap_ld")
-            cmap_vort = st.selectbox("Colormap (vortex)", cmap_options,
-                                       index=cmap_options.index('vort'),
-                                       key="fs_cmap_vort")
-            show_cb   = st.checkbox("Show colorbar", True, key="fs_cb")
-            show_grid = st.checkbox("Show grid", True, key="fs_grid")
-            grid_alpha = st.slider("Grid alpha", 0.0, 1.0, 0.3, 0.05,
-                                     key="fs_galpha")
-            invert_cm = st.checkbox("Invert colormap", False, key="fs_invert")
-
-        st.markdown("---")
-        # ---------- Geometry view settings ----------
-        st.subheader("Geometry View")
-        col_g1, col_g2, col_g3 = st.columns(3)
-        with col_g1:
-            show_frame  = st.checkbox("Show frame", True, key="gv_frame")
-            show_arms   = st.checkbox("Show arms", True, key="gv_arms")
-            show_disks  = st.checkbox("Show prop disks", True, key="gv_disks")
-            show_blade  = st.checkbox("Show blade q-c", True, key="gv_blade")
-            show_cp     = st.checkbox("Show control points", True, key="gv_cp")
-            show_bv     = st.checkbox("Show bound vortices", False, key="gv_bv")
-            show_tv     = st.checkbox("Show trailing vortices", False, key="gv_tv")
-        with col_g2:
-            show_pgrid  = st.checkbox("Show panel grid", False, key="gv_pgrid")
-            show_batt   = st.checkbox("Show battery", True, key="gv_batt")
-            show_cam    = st.checkbox("Show camera", True, key="gv_cam")
-            show_labels = st.checkbox("Show arm labels", True, key="gv_labels")
-            disk_alpha  = st.slider("Disk alpha", 0.0, 1.0, 0.25, 0.05,
-                                      key="gv_da")
-            blade_alpha = st.slider("Blade alpha", 0.0, 1.0, 1.0, 0.05,
-                                      key="gv_ba")
-            ms_control  = st.slider("Control-point size", 2.0, 12.0,
-                                      5.0, 0.5, key="gv_ms")
-        with col_g3:
-            col_frame   = st.color_picker("Frame colour", "#111111",
-                                            key="gv_c_frame")
-            col_disk    = st.color_picker("Prop-disk colour", "#1f77b4",
-                                            key="gv_c_disk")
-            col_cp      = st.color_picker("Control-point colour", "#d62728",
-                                            key="gv_c_cp")
-            col_bv      = st.color_picker("Bound-vortex colour", "#2ca02c",
-                                            key="gv_c_bv")
-            col_tv      = st.color_picker("Trailing-vortex colour", "#9467bd",
-                                            key="gv_c_tv")
-            col_batt    = st.color_picker("Battery colour", "#2ca02c",
-                                            key="gv_c_batt")
-            col_cam     = st.color_picker("Camera colour", "#ff7f0e",
-                                            key="gv_c_cam")
-
-        # ---- Rebuild the four dataclass instances from widget values ----
-        # This runs on every rerun, so the instances below always reflect
-        # the latest widget state.  They are used by every consumer tab
-        # (Geometry, Mesh, Single Eval, Optimise, Surrogate, Convergence).
-        mesh_settings = MeshSettings(
-            n_panels_per_prop=n_panels,
-            vortex_core_radius=core_rad,
-            horseshoe_length_factor=shoe_fac,
-            n_helix_segments=n_helix)
-        surrogate_settings = SurrogateSettings(
-            backend=backend, corr=corr, poly=poly,
-            theta0=float(theta0), nugget=float(nugget),
-            sweep_var_x=int(sweep_x[0]), sweep_var_y=int(sweep_y[0]),
-            n_grid=n_grid, n_levels=n_lev,
-            show_low_fidelity_points=show_lo,
-            show_high_fidelity_points=show_hi,
-            show_uncertainty_band=show_unc,
-            colormap=surr_cmap)
-        fig_settings = FigureSettings(
-            figsize=(fig_width, fig_height),
-            dpi=fig_dpi, font_size=font_size, legend_size=legend_sz,
-            colormap_ld=cmap_ld, colormap_vort=cmap_vort,
-            show_colorbar=show_cb, show_grid=show_grid,
-            grid_alpha=grid_alpha, invert_colormap=invert_cm)
-        view_settings = GeometryViewSettings(
-            show_frame=show_frame, show_arms=show_arms,
-            show_prop_disks=show_disks, show_blade_qc=show_blade,
-            show_prop_panels=show_cp, show_control_points=show_cp,
-            show_bound_vortices=show_bv,
-            show_trailing_vortices=show_tv,
-            show_panel_grid=show_pgrid,
-            show_battery=show_batt, show_camera=show_cam,
-            show_arm_labels=show_labels,
-            color_frame=col_frame, color_prop_disk=col_disk,
-            color_blade_qc=col_disk, color_control_pts=col_cp,
-            color_bound_vortex=col_bv, color_trailing_vortex=col_tv,
-            color_battery=col_batt, color_camera=col_cam,
-            disk_alpha=disk_alpha, blade_alpha=blade_alpha,
-            ms_control=ms_control)
-        # Persist to session_state so they survive across reruns even if
-        # the Settings tab is somehow skipped (defensive programming).
-        st.session_state['mesh_settings']      = mesh_settings
-        st.session_state['surrogate_settings'] = surrogate_settings
-        st.session_state['fig_settings']      = fig_settings
-        st.session_state['view_settings']     = view_settings
+    _gv_frame = st.session_state.get('gv_frame', DEFAULT_VIEW_SETTINGS.show_frame)
+    _gv_arms  = st.session_state.get('gv_arms', DEFAULT_VIEW_SETTINGS.show_arms)
+    _gv_disks = st.session_state.get('gv_disks', DEFAULT_VIEW_SETTINGS.show_prop_disks)
+    _gv_blade = st.session_state.get('gv_blade', DEFAULT_VIEW_SETTINGS.show_blade_qc)
+    _gv_cp    = st.session_state.get('gv_cp', DEFAULT_VIEW_SETTINGS.show_control_points)
+    _gv_bv    = st.session_state.get('gv_bv', DEFAULT_VIEW_SETTINGS.show_bound_vortices)
+    _gv_tv    = st.session_state.get('gv_tv', DEFAULT_VIEW_SETTINGS.show_trailing_vortices)
+    _gv_pgrid = st.session_state.get('gv_pgrid', DEFAULT_VIEW_SETTINGS.show_panel_grid)
+    _gv_batt  = st.session_state.get('gv_batt', DEFAULT_VIEW_SETTINGS.show_battery)
+    _gv_cam   = st.session_state.get('gv_cam', DEFAULT_VIEW_SETTINGS.show_camera)
+    _gv_labels = st.session_state.get('gv_labels', DEFAULT_VIEW_SETTINGS.show_arm_labels)
+    _gv_da    = st.session_state.get('gv_da', DEFAULT_VIEW_SETTINGS.disk_alpha)
+    _gv_ba    = st.session_state.get('gv_ba', DEFAULT_VIEW_SETTINGS.blade_alpha)
+    _gv_ms    = st.session_state.get('gv_ms', DEFAULT_VIEW_SETTINGS.ms_control)
+    _gv_c_frame = st.session_state.get('gv_c_frame', DEFAULT_VIEW_SETTINGS.color_frame)
+    _gv_c_disk  = st.session_state.get('gv_c_disk', DEFAULT_VIEW_SETTINGS.color_prop_disk)
+    _gv_c_cp    = st.session_state.get('gv_c_cp', DEFAULT_VIEW_SETTINGS.color_control_pts)
+    _gv_c_bv    = st.session_state.get('gv_c_bv', DEFAULT_VIEW_SETTINGS.color_bound_vortex)
+    _gv_c_tv    = st.session_state.get('gv_c_tv', DEFAULT_VIEW_SETTINGS.color_trailing_vortex)
+    _gv_c_batt  = st.session_state.get('gv_c_batt', DEFAULT_VIEW_SETTINGS.color_battery)
+    _gv_c_cam   = st.session_state.get('gv_c_cam', DEFAULT_VIEW_SETTINGS.color_camera)
+    view_settings = GeometryViewSettings(
+        show_frame=_gv_frame, show_arms=_gv_arms,
+        show_prop_disks=_gv_disks, show_blade_qc=_gv_blade,
+        show_prop_panels=_gv_cp, show_control_points=_gv_cp,
+        show_bound_vortices=_gv_bv, show_trailing_vortices=_gv_tv,
+        show_panel_grid=_gv_pgrid,
+        show_battery=_gv_batt, show_camera=_gv_cam,
+        show_arm_labels=_gv_labels,
+        color_frame=_gv_c_frame, color_prop_disk=_gv_c_disk,
+        color_blade_qc=_gv_c_disk, color_control_pts=_gv_c_cp,
+        color_bound_vortex=_gv_c_bv, color_trailing_vortex=_gv_c_tv,
+        color_battery=_gv_c_batt, color_camera=_gv_c_cam,
+        disk_alpha=_gv_da, blade_alpha=_gv_ba, ms_control=_gv_ms)
+    # Persist to session_state (defensive: in case a tab checks session_state
+    # directly instead of using the local variable).
+    st.session_state['mesh_settings']      = mesh_settings
+    st.session_state['surrogate_settings'] = surrogate_settings
+    st.session_state['fig_settings']      = fig_settings
+    st.session_state['view_settings']     = view_settings
 
     # ----- Geometry tab -----
-    with tabs[1]:
+    with tabs[0]:
         st.header("Drone Geometry (top view)")
+        # ---- Geometry View controls (inline, above the plot) ----
+        with st.expander("🎨 Geometry view settings", expanded=False):
+            col_g1, col_g2, col_g3 = st.columns(3)
+            with col_g1:
+                show_frame  = st.checkbox("Show frame", True, key="gv_frame")
+                show_arms   = st.checkbox("Show arms", True, key="gv_arms")
+                show_disks  = st.checkbox("Show prop disks", True, key="gv_disks")
+                show_blade  = st.checkbox("Show blade q-c", True, key="gv_blade")
+                show_cp     = st.checkbox("Show control points", True, key="gv_cp")
+                show_bv     = st.checkbox("Show bound vortices", False, key="gv_bv")
+                show_tv     = st.checkbox("Show trailing vortices", False, key="gv_tv")
+            with col_g2:
+                show_pgrid  = st.checkbox("Show panel grid", False, key="gv_pgrid")
+                show_batt   = st.checkbox("Show battery", True, key="gv_batt")
+                show_cam    = st.checkbox("Show camera", True, key="gv_cam")
+                show_labels = st.checkbox("Show arm labels", True, key="gv_labels")
+                disk_alpha  = st.slider("Disk alpha", 0.0, 1.0, 0.25, 0.05, key="gv_da")
+                blade_alpha = st.slider("Blade alpha", 0.0, 1.0, 1.0, 0.05, key="gv_ba")
+                ms_control  = st.slider("Control-point size", 2.0, 12.0, 5.0, 0.5, key="gv_ms")
+            with col_g3:
+                col_frame   = st.color_picker("Frame colour", "#111111", key="gv_c_frame")
+                col_disk    = st.color_picker("Prop-disk colour", "#1f77b4", key="gv_c_disk")
+                col_cp      = st.color_picker("Control-point colour", "#d62728", key="gv_c_cp")
+                col_bv      = st.color_picker("Bound-vortex colour", "#2ca02c", key="gv_c_bv")
+                col_tv      = st.color_picker("Trailing-vortex colour", "#9467bd", key="gv_c_tv")
+                col_batt    = st.color_picker("Battery colour", "#2ca02c", key="gv_c_batt")
+                col_cam     = st.color_picker("Camera colour", "#ff7f0e", key="gv_c_cam")
         geom = FPVDroneGeometry(eval_design, drone_class,
-                                 n_panels_per_prop=mesh_settings.n_panels_per_prop)
+                                 n_panels_per_prop=mesh_settings.n_panels_per_prop,
+                                 mesh_settings=mesh_settings)
         fig = geom.plot_top_view(view_settings=view_settings,
                                   fig_settings=fig_settings)
         if fig is FAILED:
@@ -2337,17 +2368,46 @@ def main():
                    f"VLM panels: {geom.meta['total_panels']}")
 
     # ----- Mesh tab -----
-    with tabs[2]:
+    with tabs[1]:
         st.header("VLM mesh visualization")
+        # ---- Mesh/VLM controls (inline, above the plot) ----
+        with st.expander("🔧 Mesh & VLM solver settings", expanded=True):
+            st.caption("These parameters control the vortex-lattice discretisation, "
+                       "helical wake model, and Biot-Savart regularization. "
+                       "**Blade count** is read from the sidebar's single-design evaluator.")
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                n_panels  = st.slider("Panels per propeller blade", 4, 32, 20, 1,
+                                        key="ms_panels",
+                                        help="VLM typically requires 15-20+ panels "
+                                             "for converged induced drag.")
+                n_helix   = st.slider("Helical wake segments", 1, 20, 8, 1,
+                                        key="ms_helix",
+                                        help="Trailing-vortex helix discretisation. "
+                                             "1 = simplified single-segment helix; "
+                                             "8+ = proper curved helical wake.")
+                spacing   = st.selectbox("Panel spacing", ['cosine', 'uniform'],
+                                           index=0, key="ms_spacing",
+                                           help="Cosine clusters panels near root "
+                                                "and tip for better tip-vortex resolution.")
+            with col_m2:
+                core_rad  = st.slider("Lamb-Oseen core r (m)", 0.001, 0.20, 0.05,
+                                        0.001, key="ms_core",
+                                        help="Regularizes the 1/r singularity in "
+                                             "Biot-Savart when control points are "
+                                             "close to vortex filaments.")
+                shoe_fac  = st.slider("Horseshoe length (× chord)", 10.0, 200.0,
+                                        50.0, 5.0, key="ms_shoe")
+                wake_cont = st.slider("Wake contraction", 0.0, 0.40, 0.15, 0.01,
+                                        key="ms_wake_cont",
+                                        help="Radial wake contraction ratio. "
+                                             "0.0 = none, 0.15 = 15% contraction "
+                                             "(real propeller wakes contract).")
         st.caption("Horseshoe vortices (bound segment + **helical** trailing "
-                   "legs) and 3/4-chord control points. The trailing-leg "
-                   "length shown here is capped at 0.6 m for readability; "
-                   "the actual solver honours the full "
-                   f"`horseshoe_length_factor = "
-                   f"{mesh_settings.horseshoe_length_factor:.1f}` with "
-                   f"`n_helix_segments = {mesh_settings.n_helix_segments}`.")
+                   "legs with wake contraction) and 3/4-chord control points.")
         geom = FPVDroneGeometry(eval_design, drone_class,
-                                 n_panels_per_prop=mesh_settings.n_panels_per_prop)
+                                 n_panels_per_prop=mesh_settings.n_panels_per_prop,
+                                 mesh_settings=mesh_settings)
         fig = geom.plot_mesh(view_settings=view_settings,
                               fig_settings=fig_settings,
                               mesh_settings=mesh_settings,
@@ -2357,9 +2417,9 @@ def main():
         else:
             st.pyplot(fig)
             plt.close(fig)
-        # Mesh summary table
+        # Mesh summary
         st.subheader("Mesh summary")
-        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+        mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
         with mcol1:
             st.metric("Panels / blade", mesh_settings.n_panels_per_prop)
         with mcol2:
@@ -2370,13 +2430,16 @@ def main():
         with mcol4:
             st.metric("Horseshoe factor",
                        f"{mesh_settings.horseshoe_length_factor:.1f}×")
+        with mcol5:
+            st.metric("Panel spacing", mesh_settings.panel_spacing)
 
     # ----- Single Eval tab -----
-    with tabs[3]:
+    with tabs[2]:
         st.header("Single-design aerodynamic evaluation")
         if st.button("Evaluate low + mid fidelity"):
             geom = FPVDroneGeometry(eval_design, drone_class,
-                                     n_panels_per_prop=mesh_settings.n_panels_per_prop)
+                                     n_panels_per_prop=mesh_settings.n_panels_per_prop,
+                                     mesh_settings=mesh_settings)
             vlm = SpectralVLMSolver(geom, eval_design, rho=rho_air,
                                      mesh_settings=mesh_settings)
             vlm_res = vlm.solve()
@@ -2422,7 +2485,7 @@ def main():
             plt.close(fig)
 
     # ----- Optimise tab -----
-    with tabs[4]:
+    with tabs[3]:
         st.header("Variable-fidelity optimisation")
         if st.button("Run optimisation", type="primary"):
             opt = VariableFidelityOptimizer(
@@ -2445,27 +2508,58 @@ def main():
                 st.json(result['best_design'])
 
     # ----- Surrogate tab -----
-    with tabs[5]:
+    with tabs[4]:
         st.header("Cokriging surrogate")
-        # Show the current sweep selection up-front.
-        ix, iy = (surrogate_settings.sweep_var_x,
-                   surrogate_settings.sweep_var_y)
-        if ix == iy:
-            ix, iy = 0, 1
-        st.caption(f"Response surface sweeps "
-                   f"**{SurrogateSettings.DIM_NAMES[ix]}** × "
-                   f"**{SurrogateSettings.DIM_NAMES[iy]}** "
-                   f"(other variables held at class midpoints). ")
+        # ---- Surrogate controls (inline, above the plots) ----
+        with st.expander("📊 Surrogate settings", expanded=True):
+            smt_status = "✅ available" if SMT_AVAILABLE else "❌ not installed"
+            st.caption(f"_smt package: **{smt_status}**_")
+            col_s1, col_s2 = st.columns(2)
+            with col_s1:
+                st.markdown("**Model**")
+                backend = st.selectbox("Backend", ['auto', 'smt', 'numpy'],
+                                         index=0, key="ss_backend")
+                corr    = st.selectbox("Correlation kernel (SMT only)",
+                                         ['squar_exp', 'abs_exp', 'matern32'],
+                                         index=0, key="ss_corr")
+                poly    = st.selectbox("Polynomial basis (SMT only)",
+                                         ['constant', 'linear'],
+                                         index=0, key="ss_poly")
+                theta0  = st.number_input("theta0 (hyperparameter)",
+                                            value=1e-2, format="%.2e",
+                                            step=1e-3, key="ss_theta0")
+                nugget  = st.number_input("Nugget (regularization)",
+                                            value=1e-8, format="%.2e",
+                                            step=1e-9, key="ss_nugget")
+            with col_s2:
+                st.markdown("**Response-surface plotting**")
+                dim_pairs = list(enumerate(SurrogateSettings.DIM_NAMES))
+                sweep_x = st.selectbox("Sweep variable (X axis)", dim_pairs,
+                                         format_func=lambda x: x[1], index=0,
+                                         key="ss_sweep_x")
+                sweep_y = st.selectbox("Sweep variable (Y axis)", dim_pairs,
+                                         format_func=lambda x: x[1], index=1,
+                                         key="ss_sweep_y")
+                n_grid  = st.slider("Grid resolution", 10, 80, 30, 5, key="ss_ngrid")
+                n_lev   = st.slider("Contour levels", 5, 40, 20, 1, key="ss_nlev")
+                show_lo = st.checkbox("Show low-fidelity samples", True, key="ss_show_lo")
+                show_hi = st.checkbox("Show high-fidelity samples", True, key="ss_show_hi")
+                show_unc = st.checkbox("Overlay ±σ uncertainty band", False, key="ss_unc")
+                surr_cmap = st.selectbox("Response-surface colormap",
+                                            cmap_options,
+                                            index=cmap_options.index('ld'),
+                                            key="ss_cmap")
         if 'opt_result' not in st.session_state:
             st.info("Run the optimisation first.")
         else:
             result = st.session_state.opt_result
             vis = FPVDroneVisualizer()
+            ix, iy = (surrogate_settings.sweep_var_x,
+                       surrogate_settings.sweep_var_y)
+            if ix == iy:
+                ix, iy = 0, 1
             st.subheader(f"Response surface ({SurrogateSettings.DIM_NAMES[ix]} "
                          f"vs {SurrogateSettings.DIM_NAMES[iy]})")
-            # Refit the surrogate from the stored optimisation result. The
-            # CokrigingSurrogate is reconstructed with the user-chosen
-            # backend / kernel / theta0 / nugget / poly from surrogate_settings.
             surr = CokrigingSurrogate(
                 n_low=result['X_low'].shape[0],
                 n_high=result['X_high'].shape[0],
@@ -2508,8 +2602,26 @@ def main():
                            f"{len(result['X_high'])}")
 
     # ----- Convergence tab -----
-    with tabs[6]:
+    with tabs[5]:
         st.header("Optimisation convergence")
+        # ---- Figure appearance controls (inline, above the plot) ----
+        with st.expander("🎨 Figure appearance (applies to all plots)", expanded=False):
+            col_f1, col_f2 = st.columns(2)
+            with col_f1:
+                fig_width  = st.slider("Figure width (in)", 4, 16, 8, 1, key="fig_w")
+                fig_height = st.slider("Figure height (in)", 3, 12, 6, 1, key="fig_h")
+                fig_dpi    = st.slider("DPI", 60, 200, 100, 10, key="fig_dpi")
+                font_size  = st.slider("Font size", 6, 18, 10, 1, key="fs_font")
+                legend_sz  = st.slider("Legend size", 6, 14, 8, 1, key="fs_leg")
+            with col_f2:
+                cmap_ld   = st.selectbox("Colormap (L/D)", cmap_options,
+                                           index=cmap_options.index('ld'), key="fs_cmap_ld")
+                cmap_vort = st.selectbox("Colormap (vortex)", cmap_options,
+                                           index=cmap_options.index('vort'), key="fs_cmap_vort")
+                show_cb   = st.checkbox("Show colorbar", True, key="fs_cb")
+                show_grid = st.checkbox("Show grid", True, key="fs_grid")
+                grid_alpha = st.slider("Grid alpha", 0.0, 1.0, 0.3, 0.05, key="fs_galpha")
+                invert_cm = st.checkbox("Invert colormap", False, key="fs_invert")
         if 'opt_result' not in st.session_state:
             st.info("Run the optimisation first.")
         else:
@@ -2537,7 +2649,7 @@ def main():
             st.table(hist_data)
 
     # ----- Export tab -----
-    with tabs[7]:
+    with tabs[6]:
         st.header("Export results")
         if 'opt_result' not in st.session_state:
             st.info("Run the optimisation first.")
