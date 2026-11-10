@@ -95,14 +95,27 @@ logger = logging.getLogger(__name__)
 # Optional 3D mesh generation backend (Gmsh OCC API + PyVista for viz).
 # When unavailable the 3D CAD & Mesh tab shows a friendly install hint
 # instead of crashing the whole app.
+#
+# We catch BOTH ImportError and OSError because:
+#   - ImportError: the Python package isn't installed (pip install gmsh pyvista)
+#   - OSError: the package is installed but a system shared library is missing
+#     (e.g. libGLU.so.1 on a headless server / Streamlit Cloud container).
+#     gmsh links against OpenGL / GLU / X11 libraries that are NOT installed
+#     by default on Ubuntu server images, so `import gmsh` raises:
+#       OSError: libGLU.so.1: cannot open shared object file: No such file or
+#                directory
+#     even though the gmsh Python wheel is present.  Catching OSError here
+#     lets the app keep running with the 3D tab disabled, instead of
+#     crashing the entire Streamlit script.
 try:
     import gmsh
     import pyvista as pv
     GMSH_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError) as _e:
     GMSH_AVAILABLE = False
-    logger.warning("gmsh or pyvista not found. 3D mesh generation will be disabled. "
-                   "Install with: pip install gmsh pyvista")
+    logger.warning("gmsh or pyvista not found or missing system libraries. "
+                   "3D mesh generation will be disabled. "
+                   "Error: %s", _e)
 
 
 # ============================================================================
@@ -2703,11 +2716,19 @@ def main():
         """)
 
         if not GMSH_AVAILABLE:
-            st.error("⚠️ `gmsh` and `pyvista` are not installed. "
-                     "Please run: `pip install gmsh pyvista`")
+            st.error("⚠️ `gmsh` and `pyvista` are not available. "
+                     "This is usually caused by either:")
+            st.markdown(
+                "1. **Python packages not installed** — run "
+                "`pip install gmsh pyvista`\n"
+                "2. **Missing system libraries** (libGLU.so.1, etc.) — "
+                "on Streamlit Cloud, create a `.streamlit/packages.txt` "
+                "file containing: `libgl1`, `libglu1-mesa`, `libxrender1`, "
+                "`libxext6`, `libsm6`, `libx11-6`, `libgomp1`")
             st.info("The 2D VLM mesh in the previous tab works without "
-                    "Gmsh.  Install Gmsh + PyVista to unlock the 3D "
-                    "publication-grade mesh generator.")
+                    "Gmsh.  Install Gmsh + PyVista (and the system "
+                    "libraries) to unlock the 3D publication-grade mesh "
+                    "generator.")
         else:
             col1, col2 = st.columns(2)
             with col1:
