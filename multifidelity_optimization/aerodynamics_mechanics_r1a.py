@@ -359,13 +359,16 @@ class GeometryViewSettings:
 @dataclass
 class MeshSettings:
     """VLM / mid-fidelity mesh and solver-level tunables."""
-    n_panels_per_prop: int = 8
+    n_panels_per_prop: int = 16            # was 8; 16+ needed for converged CDi
     vortex_core_radius: float = 0.05        # Lamb-Oseen core, [m]
     horseshoe_length_factor: float = 50.0   # trailing-leg length = factor * chord
     r_root_fraction: float = 0.10           # blade root radius = frac * prop_R
     chord_root_fraction: float = 0.15       # root chord = frac * pitch
     chord_tip_fraction: float = 0.05        # tip chord = frac * pitch
     blade_count_for_viz: int = 1            # blades drawn per prop (VLM uses 1 lifting line)
+    n_helix_segments: int = 5              # trailing-leg helical discretisation
+                                           # 1 = simplified single-segment helix
+                                           # 5+ = proper curved helical wake
 
 
 @dataclass
@@ -596,11 +599,23 @@ class FPVDroneGeometry:
             # (blade angle decreases towards tip due to increasing tangential v)
             r_mid = 0.5 * (r[:-1] + r[1:])
             local_pitch_angle = np.arctan2(pitch, 2 * np.pi * r_mid)
-            # control points at 3/4-chord of each panel
-            cp_x = cx + r_mid * np.cos(arm_angles[i] + np.pi / 2)
-            cp_y = cy + r_mid * np.sin(arm_angles[i] + np.pi / 2)
+            # Control points at 3/4-chord from the leading edge.
+            # The blade span direction is arm_angle + pi/2, so the chord
+            # direction (perpendicular to span) is arm_angle.  The leading
+            # edge faces the -arm_angle direction (direction of rotation
+            # for a CCW prop).  Mid-chord = 0 offset, LE = -0.5*chord,
+            # so 3/4-chord from LE = +0.25*chord from mid-chord, in the
+            # +arm_angle direction.
+            # BUG FIX (was): control point was at mid-chord (no offset),
+            # violating the fundamental VLM requirement that the control
+            # point sits at 3/4-chord while the bound vortex sits at 1/4-chord.
+            cp_x = cx + r_mid * np.cos(arm_angles[i] + np.pi / 2) \
+                 + 0.25 * chord * np.cos(arm_angles[i])
+            cp_y = cy + r_mid * np.sin(arm_angles[i] + np.pi / 2) \
+                 + 0.25 * chord * np.sin(arm_angles[i])
             cp_z = np.zeros(n_pan)
-            # bound vortex at 1/4-chord
+            # Bound vortex at 1/4-chord from the leading edge = -0.25*chord
+            # from mid-chord, in the -arm_angle direction (toward the LE).
             bv_x = cx + (r[:-1] + r[1:]) / 2 * np.cos(arm_angles[i] + np.pi / 2) \
                 - 0.25 * chord * np.cos(arm_angles[i])
             bv_y = cy + (r[:-1] + r[1:]) / 2 * np.sin(arm_angles[i] + np.pi / 2) \
@@ -778,7 +793,7 @@ class FPVDroneGeometry:
         return fig
 
     def plot_mesh(self, ax=None, view_settings=None, fig_settings=None,
-                   mesh_settings=None):
+                   mesh_settings=None, design=None):
         """VLM mesh visualization: horseshoe vortices + control points.
 
         This is a focused diagnostic plot for the VLM discretisation: it
@@ -786,6 +801,11 @@ class FPVDroneGeometry:
         "horseshoe"), and every control point at 3/4-chord.  Useful when
         tuning `MeshSettings.n_panels_per_prop` and
         `MeshSettings.horseshoe_length_factor`.
+
+        If `design` is provided (containing `cruise_speed` and `prop_rpm`),
+        the trailing legs are drawn as helical polylines matching the
+        solver's wake model.  Otherwise, straight trailing legs are drawn
+        as a fallback.
 
         The plot reuses :class:`GeometryViewSettings` for colours so that
         the same palette applies to both the top-view and the mesh view.
@@ -835,19 +855,32 @@ class FPVDroneGeometry:
                         color=vs.color_bound_vortex, lw=vs.lw_bound,
                         alpha=vs.blade_alpha,
                         label='Bound vortex' if (i == 0 and j == 0) else None)
-                # Trailing legs in +x direction
+                # Trailing legs: helical wake visualization.
+                # Instead of straight +x lines, draw a helical polyline
+                # that matches the solver's _helical_leg_induced_velocity.
+                # This makes the mesh plot visually consistent with the
+                # physics: the wake spirals as it convects downstream.
                 L = ms.horseshoe_length_factor * pp['chord'][j]
-                # Cap the visualization length so the plot stays readable.
-                Lvis = min(L, 0.6)
-                p1_inf = p1 + np.array([Lvis, 0.0])
-                p2_inf = p2 + np.array([Lvis, 0.0])
-                ax.plot([p1[0], p1_inf[0]], [p1[1], p1_inf[1]], '-',
-                        color=vs.color_trailing_vortex, lw=vs.lw_trailing,
-                        alpha=0.6,
-                        label='Trailing vortex' if (i == 0 and j == 0) else None)
-                ax.plot([p2[0], p2_inf[0]], [p2[1], p2_inf[1]], '-',
-                        color=vs.color_trailing_vortex, lw=vs.lw_trailing,
-                        alpha=0.6)
+                Lvis = min(L, 0.6)  # cap for readability
+                # Get freestream and RPM from the design dict (if available)
+                if design is not None:
+                    V_inf = max(float(design.get('cruise_speed', 15.0)), 1.0)
+                    rpm = float(design.get('prop_rpm', 10000.0))
+                    omega = rpm * 2.0 * np.pi / 60.0
+                else:
+                    V_inf = 15.0  # fallback
+                    omega = 10000.0 * 2.0 * np.pi / 60.0
+                t_total = Lvis / V_inf
+                n_seg = max(1, ms.n_helix_segments)
+                taus = np.linspace(0.0, t_total, n_seg + 1)
+                for r_blade in [r1, r2]:
+                    angles = th - omega * taus
+                    xs = mx + r_blade * np.cos(angles) + V_inf * taus
+                    ys = my + r_blade * np.sin(angles)
+                    ax.plot(xs, ys, '-',
+                            color=vs.color_trailing_vortex, lw=vs.lw_trailing,
+                            alpha=0.6,
+                            label='Trailing vortex (helical)' if (i == 0 and j == 0) else None)
                 # Control point at 3/4-chord
                 cp = pp['control_pts'][j]
                 ax.plot(cp[0], cp[1], marker='o',
@@ -905,6 +938,10 @@ class SpectralVLMSolver:
         # Defaults reproduce the original hard-coded 50.0 factor.
         ms = mesh_settings if mesh_settings is not None else DEFAULT_MESH_SETTINGS
         self.horseshoe_length_factor = float(ms.horseshoe_length_factor)
+        # Helical wake discretisation: n_helix_segments = 1 gives the
+        # simplified single-segment helical offset (user's proposed fix);
+        # n_helix_segments >= 5 gives a proper curved helical polyline.
+        self.n_helix_segments = int(ms.n_helix_segments)
         # Build linear system once (geometry doesn't change during a solve)
         self._build_influence_matrix()
 
@@ -953,16 +990,61 @@ class SpectralVLMSolver:
         p2 = np.array([mx + r2 * np.cos(th), my + r2 * np.sin(th), 0.0])
 
         w_bound = self._biot_savart_segment(p1, p2, cp)
-        # Trailing vortices from p1 and p2 to (+inf, same y, same z)
-        # We approximate the infinite segment by a horseshoe_length_factor *
-        # chord-length segment (default 50, configurable via MeshSettings).
+        # Trailing vortices: helical wake approximation.
+        #
+        # A propeller wake is NOT straight — it spirals because the blade
+        # rotates while the wake convects downstream.  The trailing vortex
+        # filament from a blade point at radius r, blade angle th, follows
+        # a helix parameterised by wake age tau >= 0:
+        #
+        #   x(tau) = mx + r * cos(th - omega * tau) + V_inf * tau
+        #   y(tau) = my + r * sin(th - omega * tau)
+        #   z(tau) = 0
+        #
+        # At tau=0 the point is at the blade (p1 or p2).  As tau increases,
+        # the point convects downstream (+V_inf * tau in x) and the angular
+        # position drifts backward (th - omega * tau) because the wake was
+        # shed when the blade was at an earlier angle.
+        #
+        # We discretise the helix into n_helix_segments straight Biot-Savart
+        # segments.  n_helix_segments=1 reduces to the simplified single-
+        # segment helical offset (endpoint rotated, leg still straight).
+        # n_helix_segments >= 5 gives a proper curved helical wake.
         L = self.horseshoe_length_factor * pp['chord'][j]
-        p1_inf = p1 + np.array([L, 0, 0])
-        p2_inf = p2 + np.array([L, 0, 0])
-        w_t1 = self._biot_savart_segment(p1, p1_inf, cp)
-        w_t2 = self._biot_savart_segment(p2, p2_inf, cp)
+        V_inf = max(self.freestream_speed, 1.0)  # avoid div-by-zero in hover
+        t_total = L / V_inf                        # convection time over length L
+        theta_rot = self.omega * t_total           # total rotation angle
+        n_seg = max(1, self.n_helix_segments)
+
+        w_t1 = self._helical_leg_induced_velocity(
+            mx, my, r1, th, t_total, n_seg, cp)
+        w_t2 = self._helical_leg_induced_velocity(
+            mx, my, r2, th, t_total, n_seg, cp)
         # Z-component of total induced velocity (per unit Gamma)
         return (w_bound + w_t1 + w_t2)[2]
+
+    def _helical_leg_induced_velocity(self, mx, my, r, th, t_total,
+                                       n_seg, cp):
+        """Compute the induced velocity at cp from a helical trailing
+        vortex leg shed from blade point (mx + r*cos(th), my + r*sin(th), 0).
+
+        The helix is discretised into n_seg straight Biot-Savart segments.
+        """
+        V_inf = max(self.freestream_speed, 1.0)
+        omega = self.omega
+        # Generate the helix points: tau from 0 to t_total
+        taus = np.linspace(0.0, t_total, n_seg + 1)
+        # Pre-compute all helix points
+        angles = th - omega * taus          # angular position at each tau
+        xs = mx + r * np.cos(angles) + V_inf * taus
+        ys = my + r * np.sin(angles)
+        zs = np.zeros(n_seg + 1)
+        pts = np.column_stack([xs, ys, zs])
+        # Sum Biot-Savart over each straight segment
+        w_total = np.zeros(3)
+        for k in range(n_seg):
+            w_total += self._biot_savart_segment(pts[k], pts[k + 1], cp)
+        return w_total
 
     @staticmethod
     def _biot_savart_segment(p1, p2, cp):
@@ -1034,7 +1116,15 @@ class SpectralVLMSolver:
                             + (self.omega * pp['r_mid'][ji]) ** 2)
             panel_lift[i] = self.rho * V_eff * gamma[i] * span
 
-        total_lift = float(np.sum(panel_lift))
+        # CRITICAL FIX: The VLM discretises each propeller as a SINGLE lifting
+        # line (one representative blade).  The actual propeller has
+        # `blade_count` blades, so the total thrust/lift must be multiplied
+        # by the number of blades.  Without this multiplier, a 3-blade prop
+        # produces only 1/3 of its real lift, creating a massive (and false)
+        # L/D ratio because the viscous drag (computed in MidFidelityCorrector)
+        # already accounts for all blades via the wetted-area term.
+        n_blades = int(self.design.get('blade_count', 1))
+        total_lift = float(np.sum(panel_lift)) * n_blades
 
         # Induced drag (treating each prop as a finite wing):
         # CDi = CL^2 / (pi * AR * e),  e ~ 0.7 for prop disks
@@ -1903,6 +1993,25 @@ def main():
         page_title="FPV Drone Variable-Fidelity Optimizer",
         layout="wide", initial_sidebar_state="expanded")
 
+    # ==============================================================
+    # ROBUST SESSION-STATE INITIALIZATION  (Part 2, Fix 2)
+    # --------------------------------------------------------------
+    # Before any widget renders, make sure session_state holds the four
+    # dataclass instances.  This prevents the fragile pattern where
+    # settings defined deep inside a collapsed sidebar expander could
+    # silently fall back to DEFAULT_* on certain rerun orderings.
+    # The Settings tab (tabs[0]) rebuilds these from widget values on
+    # every rerun; this initialization only kicks in on the very first
+    # load (or after a session reset).
+    if 'mesh_settings' not in st.session_state:
+        st.session_state.mesh_settings = DEFAULT_MESH_SETTINGS
+    if 'surrogate_settings' not in st.session_state:
+        st.session_state.surrogate_settings = DEFAULT_SURR_SETTINGS
+    if 'fig_settings' not in st.session_state:
+        st.session_state.fig_settings = DEFAULT_FIG_SETTINGS
+    if 'view_settings' not in st.session_state:
+        st.session_state.view_settings = DEFAULT_VIEW_SETTINGS
+
     st.markdown("""
     <style>
     .main-header {
@@ -2005,19 +2114,106 @@ def main():
             st.error(e)
         for w in warns:
             st.warning(w)
+        # NOTE: All customization controls (figure / geometry / mesh / surrogate)
+        # have been moved to the "⚙️ Settings" tab in the main area.  This
+        # avoids the fragile pattern of defining dataclass instances deep
+        # inside a collapsed sidebar expander where they can silently fall
+        # back to defaults on certain rerun orderings.  The Settings tab
+        # renders FIRST (before all consumer tabs) so its widget values are
+        # always up-to-date when the Geometry / Mesh / Optimise / Surrogate
+        # tabs read them.
 
-        # ============================================================
-        # 🎨 CUSTOMIZATION EXPANDER  (NEW)
-        # ------------------------------------------------------------
-        # Four collapsible sections gather every figure / geometry / mesh /
-        # surrogate option.  Each section builds one of the dataclasses
-        # defined at module top (FigureSettings, GeometryViewSettings,
-        # MeshSettings, SurrogateSettings).  Defaults reproduce the
-        # original app behaviour exactly.
-        # ============================================================
-        with st.expander("🎨 Customization", expanded=False):
-            # ---------- Figure settings ----------
-            st.markdown("**Figure settings**")
+    # ==============================================================
+    # MAIN AREA
+    # ==============================================================
+    # Settings tab is FIRST so its widgets render before any consumer tab,
+    # eliminating the one-rerun lag where consumer tabs would see stale
+    # settings on the same rerun that a setting was changed.
+    tabs = st.tabs(["⚙️ Settings", "Geometry", "Mesh", "Single Eval",
+                    "Optimise", "Surrogate", "Convergence", "Export"])
+
+    # ----- ⚙️ Settings tab (FIRST — interactive, replaces read-only JSON) -----
+    with tabs[0]:
+        st.header("⚙️ Aerodynamic & Visualization Settings")
+        st.caption("Adjust VLM mesh, helical wake, surrogate model, and "
+                   "figure appearance.  Changes take effect immediately "
+                   "in all other tabs.")
+        cmap_options = ColormapRegistry.list_all()
+
+        # ---------- Mesh / VLM settings ----------
+        st.subheader("Mesh & VLM Solver")
+        st.caption("These parameters control the vortex-lattice discretisation "
+                   "and the helical wake model.  **Blade count** is read from "
+                   "the sidebar's single-design evaluator.")
+        col_m1, col_m2, col_m3 = st.columns(3)
+        with col_m1:
+            n_panels = st.slider("Panels per propeller blade", 4, 24, 16, 1,
+                                   key="ms_panels",
+                                   help="VLM typically requires 15-20+ panels "
+                                        "for converged induced drag.")
+            n_helix  = st.slider("Helical wake segments", 1, 15, 5, 1,
+                                   key="ms_helix",
+                                   help="Trailing-vortex helix discretisation. "
+                                        "1 = simplified single-segment helix; "
+                                        "5+ = proper curved helical wake.")
+        with col_m2:
+            core_rad = st.slider("Lamb-Oseen core r (m)", 0.005, 0.20, 0.05,
+                                   0.005, key="ms_core")
+            shoe_fac = st.slider("Horseshoe length (× chord)", 10.0, 200.0,
+                                   50.0, 5.0, key="ms_shoe")
+        with col_m3:
+            st.metric("Default panels", DEFAULT_MESH_SETTINGS.n_panels_per_prop)
+            st.metric("Helical wake", "ON" if n_helix > 1 else "simplified")
+
+        st.markdown("---")
+        # ---------- Surrogate settings ----------
+        st.subheader("Cokriging Surrogate")
+        smt_status = "✅ available" if SMT_AVAILABLE else "❌ not installed"
+        st.caption(f"_smt package: **{smt_status}**_")
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            backend = st.selectbox("Backend", ['auto', 'smt', 'numpy'],
+                                     index=0, key="ss_backend")
+            corr    = st.selectbox("Correlation kernel (SMT only)",
+                                     ['squar_exp', 'abs_exp', 'matern32'],
+                                     index=0, key="ss_corr")
+            poly    = st.selectbox("Polynomial basis (SMT only)",
+                                     ['constant', 'linear'],
+                                     index=0, key="ss_poly")
+            theta0  = st.number_input("theta0 (hyperparameter)",
+                                        value=1e-2, format="%.2e",
+                                        step=1e-3, key="ss_theta0")
+            nugget  = st.number_input("Nugget (regularization)",
+                                        value=1e-8, format="%.2e",
+                                        step=1e-9, key="ss_nugget")
+        with col_s2:
+            st.markdown("**Response-surface plotting**")
+            dim_pairs = list(enumerate(SurrogateSettings.DIM_NAMES))
+            sweep_x = st.selectbox("Sweep variable (X axis)", dim_pairs,
+                                     format_func=lambda x: x[1], index=0,
+                                     key="ss_sweep_x")
+            sweep_y = st.selectbox("Sweep variable (Y axis)", dim_pairs,
+                                     format_func=lambda x: x[1], index=1,
+                                     key="ss_sweep_y")
+            n_grid  = st.slider("Grid resolution", 10, 80, 30, 5,
+                                   key="ss_ngrid")
+            n_lev   = st.slider("Contour levels", 5, 40, 20, 1, key="ss_nlev")
+            show_lo = st.checkbox("Show low-fidelity samples", True,
+                                     key="ss_show_lo")
+            show_hi = st.checkbox("Show high-fidelity samples", True,
+                                     key="ss_show_hi")
+            show_unc = st.checkbox("Overlay ±σ uncertainty band", False,
+                                     key="ss_unc")
+            surr_cmap = st.selectbox("Response-surface colormap",
+                                        cmap_options,
+                                        index=cmap_options.index('ld'),
+                                        key="ss_cmap")
+
+        st.markdown("---")
+        # ---------- Figure settings ----------
+        st.subheader("Figure Appearance")
+        col_f1, col_f2 = st.columns(2)
+        with col_f1:
             fig_width  = st.slider("Figure width (in)", 4, 16, 8, 1,
                                      key="fig_w")
             fig_height = st.slider("Figure height (in)", 3, 12, 6, 1,
@@ -2025,164 +2221,106 @@ def main():
             fig_dpi    = st.slider("DPI", 60, 200, 100, 10, key="fig_dpi")
             font_size  = st.slider("Font size", 6, 18, 10, 1, key="fs_font")
             legend_sz  = st.slider("Legend size", 6, 14, 8, 1, key="fs_leg")
-            cmap_options = ColormapRegistry.list_all()
+        with col_f2:
             cmap_ld   = st.selectbox("Colormap (L/D)", cmap_options,
                                        index=cmap_options.index('ld'),
                                        key="fs_cmap_ld")
             cmap_vort = st.selectbox("Colormap (vortex)", cmap_options,
                                        index=cmap_options.index('vort'),
                                        key="fs_cmap_vort")
-            show_cb   = st.checkbox("Show colorbar", value=True,
-                                      key="fs_cb")
-            show_grid = st.checkbox("Show grid", value=True,
-                                     key="fs_grid")
+            show_cb   = st.checkbox("Show colorbar", True, key="fs_cb")
+            show_grid = st.checkbox("Show grid", True, key="fs_grid")
             grid_alpha = st.slider("Grid alpha", 0.0, 1.0, 0.3, 0.05,
                                      key="fs_galpha")
-            invert_cm = st.checkbox("Invert colormap", value=False,
-                                     key="fs_invert")
-            fig_settings = FigureSettings(
-                figsize=(fig_width, fig_height),
-                dpi=fig_dpi, font_size=font_size, legend_size=legend_sz,
-                colormap_ld=cmap_ld, colormap_vort=cmap_vort,
-                show_colorbar=show_cb, show_grid=show_grid,
-                grid_alpha=grid_alpha, invert_colormap=invert_cm)
+            invert_cm = st.checkbox("Invert colormap", False, key="fs_invert")
 
-            st.markdown("---")
-            # ---------- Geometry view settings ----------
-            st.markdown("**Geometry view**")
-            show_frame   = st.checkbox("Show frame", True, key="gv_frame")
-            show_arms    = st.checkbox("Show arms", True, key="gv_arms")
-            show_disks   = st.checkbox("Show prop disks", True, key="gv_disks")
-            show_blade   = st.checkbox("Show blade q-c", True, key="gv_blade")
-            show_cp      = st.checkbox("Show control points", True,
-                                         key="gv_cp")
-            show_bv      = st.checkbox("Show bound vortices", False,
-                                         key="gv_bv")
-            show_tv      = st.checkbox("Show trailing vortices", False,
-                                         key="gv_tv")
-            show_pgrid   = st.checkbox("Show panel grid", False,
-                                         key="gv_pgrid")
-            show_batt    = st.checkbox("Show battery", True, key="gv_batt")
-            show_cam     = st.checkbox("Show camera", True, key="gv_cam")
-            show_labels  = st.checkbox("Show arm labels", True,
-                                         key="gv_labels")
-            disk_alpha   = st.slider("Disk alpha", 0.0, 1.0, 0.25, 0.05,
-                                       key="gv_da")
-            blade_alpha  = st.slider("Blade alpha", 0.0, 1.0, 1.0, 0.05,
-                                       key="gv_ba")
-            ms_control   = st.slider("Control-point size", 2.0, 12.0,
-                                       5.0, 0.5, key="gv_ms")
-            col_frame    = st.color_picker("Frame colour", "#111111",
-                                             key="gv_c_frame")
-            col_disk     = st.color_picker("Prop-disk colour", "#1f77b4",
-                                             key="gv_c_disk")
-            col_cp       = st.color_picker("Control-point colour",
-                                             "#d62728", key="gv_c_cp")
-            col_bv       = st.color_picker("Bound-vortex colour",
-                                             "#2ca02c", key="gv_c_bv")
-            col_tv       = st.color_picker("Trailing-vortex colour",
-                                             "#9467bd", key="gv_c_tv")
-            col_batt     = st.color_picker("Battery colour", "#2ca02c",
-                                             key="gv_c_batt")
-            col_cam      = st.color_picker("Camera colour", "#ff7f0e",
-                                             key="gv_c_cam")
-            view_settings = GeometryViewSettings(
-                show_frame=show_frame, show_arms=show_arms,
-                show_prop_disks=show_disks, show_blade_qc=show_blade,
-                show_prop_panels=show_cp, show_control_points=show_cp,
-                show_bound_vortices=show_bv,
-                show_trailing_vortices=show_tv,
-                show_panel_grid=show_pgrid,
-                show_battery=show_batt, show_camera=show_cam,
-                show_arm_labels=show_labels,
-                color_frame=col_frame, color_prop_disk=col_disk,
-                color_blade_qc=col_disk, color_control_pts=col_cp,
-                color_bound_vortex=col_bv, color_trailing_vortex=col_tv,
-                color_battery=col_batt, color_camera=col_cam,
-                disk_alpha=disk_alpha, blade_alpha=blade_alpha,
-                ms_control=ms_control)
+        st.markdown("---")
+        # ---------- Geometry view settings ----------
+        st.subheader("Geometry View")
+        col_g1, col_g2, col_g3 = st.columns(3)
+        with col_g1:
+            show_frame  = st.checkbox("Show frame", True, key="gv_frame")
+            show_arms   = st.checkbox("Show arms", True, key="gv_arms")
+            show_disks  = st.checkbox("Show prop disks", True, key="gv_disks")
+            show_blade  = st.checkbox("Show blade q-c", True, key="gv_blade")
+            show_cp     = st.checkbox("Show control points", True, key="gv_cp")
+            show_bv     = st.checkbox("Show bound vortices", False, key="gv_bv")
+            show_tv     = st.checkbox("Show trailing vortices", False, key="gv_tv")
+        with col_g2:
+            show_pgrid  = st.checkbox("Show panel grid", False, key="gv_pgrid")
+            show_batt   = st.checkbox("Show battery", True, key="gv_batt")
+            show_cam    = st.checkbox("Show camera", True, key="gv_cam")
+            show_labels = st.checkbox("Show arm labels", True, key="gv_labels")
+            disk_alpha  = st.slider("Disk alpha", 0.0, 1.0, 0.25, 0.05,
+                                      key="gv_da")
+            blade_alpha = st.slider("Blade alpha", 0.0, 1.0, 1.0, 0.05,
+                                      key="gv_ba")
+            ms_control  = st.slider("Control-point size", 2.0, 12.0,
+                                      5.0, 0.5, key="gv_ms")
+        with col_g3:
+            col_frame   = st.color_picker("Frame colour", "#111111",
+                                            key="gv_c_frame")
+            col_disk    = st.color_picker("Prop-disk colour", "#1f77b4",
+                                            key="gv_c_disk")
+            col_cp      = st.color_picker("Control-point colour", "#d62728",
+                                            key="gv_c_cp")
+            col_bv      = st.color_picker("Bound-vortex colour", "#2ca02c",
+                                            key="gv_c_bv")
+            col_tv      = st.color_picker("Trailing-vortex colour", "#9467bd",
+                                            key="gv_c_tv")
+            col_batt    = st.color_picker("Battery colour", "#2ca02c",
+                                            key="gv_c_batt")
+            col_cam     = st.color_picker("Camera colour", "#ff7f0e",
+                                            key="gv_c_cam")
 
-            st.markdown("---")
-            # ---------- Mesh settings ----------
-            st.markdown("**Mesh / VLM settings**")
-            n_panels   = st.slider("Panels per propeller blade", 4, 16, 8, 1,
-                                     key="ms_panels")
-            core_rad   = st.slider("Lamb-Oseen vortex core radius (m)",
-                                     0.005, 0.20, 0.05, 0.005,
-                                     key="ms_core")
-            shoe_fac   = st.slider("Horseshoe length factor (× chord)",
-                                     10.0, 200.0, 50.0, 5.0,
-                                     key="ms_shoe")
-            mesh_settings = MeshSettings(
-                n_panels_per_prop=n_panels,
-                vortex_core_radius=core_rad,
-                horseshoe_length_factor=shoe_fac)
-
-            st.markdown("---")
-            # ---------- Surrogate settings ----------
-            st.markdown("**Surrogate (cokriging) settings**")
-            smt_status = "available" if SMT_AVAILABLE else "not installed"
-            st.caption(f"_smt package: **{smt_status}**_")
-            backend = st.selectbox("Backend", ['auto', 'smt', 'numpy'],
-                                       index=0, key="ss_backend")
-            corr    = st.selectbox("Correlation kernel (SMT only)",
-                                       ['squar_exp', 'abs_exp', 'matern32'],
-                                       index=0, key="ss_corr")
-            poly    = st.selectbox("Polynomial basis (SMT only)",
-                                       ['constant', 'linear'],
-                                       index=0, key="ss_poly")
-            theta0  = st.number_input("theta0 (initial hyperparameter)",
-                                        value=1e-2, format="%.2e",
-                                        step=1e-3, key="ss_theta0")
-            nugget  = st.number_input("Nugget (diagonal regularization)",
-                                        value=1e-8, format="%.2e",
-                                        step=1e-9, key="ss_nugget")
-            st.markdown("*Response-surface plotting:*")
-            sweep_x = st.selectbox("Sweep variable (X axis)",
-                                      list(enumerate(SurrogateSettings.DIM_NAMES)),
-                                      format_func=lambda x: x[1], index=0,
-                                      key="ss_sweep_x")
-            sweep_y = st.selectbox("Sweep variable (Y axis)",
-                                      list(enumerate(SurrogateSettings.DIM_NAMES)),
-                                      format_func=lambda x: x[1], index=1,
-                                      key="ss_sweep_y")
-            n_grid  = st.slider("Response-surface grid resolution",
-                                  10, 80, 30, 5, key="ss_ngrid")
-            n_lev   = st.slider("Contour levels", 5, 40, 20, 1,
-                                   key="ss_nlev")
-            show_lo = st.checkbox("Show low-fidelity samples", True,
-                                     key="ss_show_lo")
-            show_hi = st.checkbox("Show high-fidelity samples", True,
-                                     key="ss_show_hi")
-            show_unc = st.checkbox("Overlay ±σ uncertainty band",
-                                      value=False, key="ss_unc")
-            surr_cmap = st.selectbox("Response-surface colormap",
-                                        cmap_options,
-                                        index=cmap_options.index('ld'),
-                                        key="ss_cmap")
-            surrogate_settings = SurrogateSettings(
-                backend=backend, corr=corr, poly=poly,
-                theta0=float(theta0), nugget=float(nugget),
-                sweep_var_x=int(sweep_x[0]), sweep_var_y=int(sweep_y[0]),
-                n_grid=n_grid, n_levels=n_lev,
-                show_low_fidelity_points=show_lo,
-                show_high_fidelity_points=show_hi,
-                show_uncertainty_band=show_unc,
-                colormap=surr_cmap)
-
-            st.session_state['fig_settings']      = fig_settings
-            st.session_state['view_settings']     = view_settings
-            st.session_state['mesh_settings']      = mesh_settings
-            st.session_state['surrogate_settings'] = surrogate_settings
-
-    # ==============================================================
-    # MAIN AREA
-    # ==============================================================
-    tabs = st.tabs(["Geometry", "Mesh", "Single Eval", "Optimise",
-                    "Surrogate", "Convergence", "Customization", "Export"])
+        # ---- Rebuild the four dataclass instances from widget values ----
+        # This runs on every rerun, so the instances below always reflect
+        # the latest widget state.  They are used by every consumer tab
+        # (Geometry, Mesh, Single Eval, Optimise, Surrogate, Convergence).
+        mesh_settings = MeshSettings(
+            n_panels_per_prop=n_panels,
+            vortex_core_radius=core_rad,
+            horseshoe_length_factor=shoe_fac,
+            n_helix_segments=n_helix)
+        surrogate_settings = SurrogateSettings(
+            backend=backend, corr=corr, poly=poly,
+            theta0=float(theta0), nugget=float(nugget),
+            sweep_var_x=int(sweep_x[0]), sweep_var_y=int(sweep_y[0]),
+            n_grid=n_grid, n_levels=n_lev,
+            show_low_fidelity_points=show_lo,
+            show_high_fidelity_points=show_hi,
+            show_uncertainty_band=show_unc,
+            colormap=surr_cmap)
+        fig_settings = FigureSettings(
+            figsize=(fig_width, fig_height),
+            dpi=fig_dpi, font_size=font_size, legend_size=legend_sz,
+            colormap_ld=cmap_ld, colormap_vort=cmap_vort,
+            show_colorbar=show_cb, show_grid=show_grid,
+            grid_alpha=grid_alpha, invert_colormap=invert_cm)
+        view_settings = GeometryViewSettings(
+            show_frame=show_frame, show_arms=show_arms,
+            show_prop_disks=show_disks, show_blade_qc=show_blade,
+            show_prop_panels=show_cp, show_control_points=show_cp,
+            show_bound_vortices=show_bv,
+            show_trailing_vortices=show_tv,
+            show_panel_grid=show_pgrid,
+            show_battery=show_batt, show_camera=show_cam,
+            show_arm_labels=show_labels,
+            color_frame=col_frame, color_prop_disk=col_disk,
+            color_blade_qc=col_disk, color_control_pts=col_cp,
+            color_bound_vortex=col_bv, color_trailing_vortex=col_tv,
+            color_battery=col_batt, color_camera=col_cam,
+            disk_alpha=disk_alpha, blade_alpha=blade_alpha,
+            ms_control=ms_control)
+        # Persist to session_state so they survive across reruns even if
+        # the Settings tab is somehow skipped (defensive programming).
+        st.session_state['mesh_settings']      = mesh_settings
+        st.session_state['surrogate_settings'] = surrogate_settings
+        st.session_state['fig_settings']      = fig_settings
+        st.session_state['view_settings']     = view_settings
 
     # ----- Geometry tab -----
-    with tabs[0]:
+    with tabs[1]:
         st.header("Drone Geometry (top view)")
         geom = FPVDroneGeometry(eval_design, drone_class,
                                  n_panels_per_prop=mesh_settings.n_panels_per_prop)
@@ -2198,20 +2336,22 @@ def main():
                    f"{geom.meta['total_drag_area']:.4f} m² | "
                    f"VLM panels: {geom.meta['total_panels']}")
 
-    # ----- Mesh tab (NEW) -----
-    with tabs[1]:
+    # ----- Mesh tab -----
+    with tabs[2]:
         st.header("VLM mesh visualization")
-        st.caption("Horseshoe vortices (bound segment + trailing legs) "
-                   "and 3/4-chord control points. The trailing-leg "
+        st.caption("Horseshoe vortices (bound segment + **helical** trailing "
+                   "legs) and 3/4-chord control points. The trailing-leg "
                    "length shown here is capped at 0.6 m for readability; "
                    "the actual solver honours the full "
                    f"`horseshoe_length_factor = "
-                   f"{mesh_settings.horseshoe_length_factor:.1f}`.")
+                   f"{mesh_settings.horseshoe_length_factor:.1f}` with "
+                   f"`n_helix_segments = {mesh_settings.n_helix_segments}`.")
         geom = FPVDroneGeometry(eval_design, drone_class,
                                  n_panels_per_prop=mesh_settings.n_panels_per_prop)
         fig = geom.plot_mesh(view_settings=view_settings,
                               fig_settings=fig_settings,
-                              mesh_settings=mesh_settings)
+                              mesh_settings=mesh_settings,
+                              design=eval_design)
         if fig is FAILED:
             st.error("Mesh plot failed - see app logs.")
         else:
@@ -2232,7 +2372,7 @@ def main():
                        f"{mesh_settings.horseshoe_length_factor:.1f}×")
 
     # ----- Single Eval tab -----
-    with tabs[2]:
+    with tabs[3]:
         st.header("Single-design aerodynamic evaluation")
         if st.button("Evaluate low + mid fidelity"):
             geom = FPVDroneGeometry(eval_design, drone_class,
@@ -2282,7 +2422,7 @@ def main():
             plt.close(fig)
 
     # ----- Optimise tab -----
-    with tabs[3]:
+    with tabs[4]:
         st.header("Variable-fidelity optimisation")
         if st.button("Run optimisation", type="primary"):
             opt = VariableFidelityOptimizer(
@@ -2305,7 +2445,7 @@ def main():
                 st.json(result['best_design'])
 
     # ----- Surrogate tab -----
-    with tabs[4]:
+    with tabs[5]:
         st.header("Cokriging surrogate")
         # Show the current sweep selection up-front.
         ix, iy = (surrogate_settings.sweep_var_x,
@@ -2368,7 +2508,7 @@ def main():
                            f"{len(result['X_high'])}")
 
     # ----- Convergence tab -----
-    with tabs[5]:
+    with tabs[6]:
         st.header("Optimisation convergence")
         if 'opt_result' not in st.session_state:
             st.info("Run the optimisation first.")
@@ -2395,77 +2535,6 @@ def main():
                     row['max_EI'] = h['EI_max']
                 hist_data.append(row)
             st.table(hist_data)
-
-    # ----- Customization tab (NEW) -----
-    with tabs[6]:
-        st.header("Customization summary")
-        st.caption("These are the four settings objects currently in "
-                   "effect.  Edit them in the sidebar's '🎨 Customization' "
-                   "expander; values here update live.")
-        st.subheader("FigureSettings")
-        st.json({
-            'figsize': list(fig_settings.figsize),
-            'dpi': fig_settings.dpi,
-            'font_size': fig_settings.font_size,
-            'legend_size': fig_settings.legend_size,
-            'colormap_ld': fig_settings.colormap_ld,
-            'colormap_vort': fig_settings.colormap_vort,
-            'show_colorbar': fig_settings.show_colorbar,
-            'show_grid': fig_settings.show_grid,
-            'grid_alpha': fig_settings.grid_alpha,
-            'invert_colormap': fig_settings.invert_colormap,
-            'bg_color': fig_settings.bg_color,
-        })
-        st.subheader("GeometryViewSettings")
-        st.json({
-            'show_frame': view_settings.show_frame,
-            'show_arms': view_settings.show_arms,
-            'show_prop_disks': view_settings.show_prop_disks,
-            'show_blade_qc': view_settings.show_blade_qc,
-            'show_control_points': view_settings.show_control_points,
-            'show_bound_vortices': view_settings.show_bound_vortices,
-            'show_trailing_vortices': view_settings.show_trailing_vortices,
-            'show_panel_grid': view_settings.show_panel_grid,
-            'show_battery': view_settings.show_battery,
-            'show_camera': view_settings.show_camera,
-            'show_arm_labels': view_settings.show_arm_labels,
-            'disk_alpha': view_settings.disk_alpha,
-            'blade_alpha': view_settings.blade_alpha,
-            'ms_control': view_settings.ms_control,
-            'color_frame': view_settings.color_frame,
-            'color_prop_disk': view_settings.color_prop_disk,
-            'color_control_pts': view_settings.color_control_pts,
-            'color_bound_vortex': view_settings.color_bound_vortex,
-            'color_trailing_vortex': view_settings.color_trailing_vortex,
-            'color_battery': view_settings.color_battery,
-            'color_camera': view_settings.color_camera,
-        })
-        st.subheader("MeshSettings")
-        st.json({
-            'n_panels_per_prop': mesh_settings.n_panels_per_prop,
-            'vortex_core_radius': mesh_settings.vortex_core_radius,
-            'horseshoe_length_factor': mesh_settings.horseshoe_length_factor,
-            'r_root_fraction': mesh_settings.r_root_fraction,
-            'chord_root_fraction': mesh_settings.chord_root_fraction,
-            'chord_tip_fraction': mesh_settings.chord_tip_fraction,
-        })
-        st.subheader("SurrogateSettings")
-        st.json({
-            'backend': surrogate_settings.backend,
-            'corr': surrogate_settings.corr,
-            'poly': surrogate_settings.poly,
-            'theta0': surrogate_settings.theta0,
-            'nugget': surrogate_settings.nugget,
-            'sweep_var_x': surrogate_settings.sweep_var_x,
-            'sweep_var_y': surrogate_settings.sweep_var_y,
-            'n_grid': surrogate_settings.n_grid,
-            'n_levels': surrogate_settings.n_levels,
-            'show_low_fidelity_points': surrogate_settings.show_low_fidelity_points,
-            'show_high_fidelity_points': surrogate_settings.show_high_fidelity_points,
-            'show_uncertainty_band': surrogate_settings.show_uncertainty_band,
-            'colormap': surrogate_settings.colormap,
-            'smt_available': SMT_AVAILABLE,
-        })
 
     # ----- Export tab -----
     with tabs[7]:
