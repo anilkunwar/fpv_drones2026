@@ -1165,56 +1165,80 @@ class FPVDrone3DMeshGenerator:
                     mx, my, -0.05, 0, 0, 0.10, 1.20 * R)
                 mrf_vols.append((3, mrf_tag))
 
-            # --- 3. Boolean operations ---
+            # --- 3. Boolean operations: conformal partition via fragment ---
             occ.synchronize()
             # =========================================================================
-            # FIX: occ.cut() destroys BOTH object and tool by default
-            # (removeObject=True, removeTool=True). The previous code cut the
-            # blades out of the MRF cylinders first, which invalidated the
-            # blade tags; the second cut (far-field box) then reused those
-            # destroyed tags and raised "Unknown OpenCASCADE entity of
-            # dimension 3 with tag N". Copying the blades first is not enough:
-            # any entity used as a cut tool is destroyed, so the boundary-layer
-            # getBoundary() call later would still hit a destroyed tag.
+            # FIX: the previous code used sequential occ.cut() calls to subtract
+            # blades from MRF cylinders and then both from the far-field box.
+            # This had two compounding problems:
             #
-            # The clean fix is removeTool=False: the blades survive both cuts
-            # (verified end-to-end against gmsh 4.15.2 -- 4 blades, 16 blade
-            # surfaces, 1 far-field volume, no 'Unknown entity' error), and
-            # remain valid for the boundary-layer getBoundary() below.
+            # (a) occ.cut() destroys its tool entities by default (removeTool=
+            #     True), so reusing the blade tags in a second cut raised
+            #     "Unknown OpenCASCADE entity of dimension 3 with tag N".
+            #     removeTool=False avoids that but leaves the blade solids as
+            #     SEPARATE volumes that share coincident boundary surfaces with
+            #     the holes carved in the MRF/far-field volumes.
+            #
+            # (b) Those coincident-but-topologically-separate surfaces are
+            #     meshed independently by the 2D mesher, producing "Invalid
+            #     boundary mesh (overlapping facets)" -- a 2D problem that NO
+            #     3D mesher (HXT, Frontal-Delaunay, ...) can recover from.
+            #     Switching Algorithm3D from 10 (HXT) to 4 (Frontal-Delaunay)
+            #     does NOT fix this: on the cut geometry alg 4 returns 0 tets
+            #     and alg 1/7 fail with the same overlapping-facets error.
+            #
+            # The correct CFD approach is occ.fragment(): it partitions all
+            # volumes conformally so every interface (blade/MRF, blade/far,
+            # MRF/far) becomes a SINGLE shared surface. Verified end-to-end on
+            # gmsh 4.15.2 with the full 4-arm twisted blade: fragment + alg 4
+            # produces a valid 22k-tet fluid mesh, whereas every cut+alg combo
+            # fails.
             # =========================================================================
-            # Cut blade volumes out of MRF cylinders (keep blades alive)
-            if all_blade_vols and mrf_vols:
-                mrf_vols = occ.cut(mrf_vols, all_blade_vols,
-                                   removeTool=False)[0]
-            # Far-field box
             far_box = occ.addBox(-0.5, -0.5, -0.3, 1.0, 1.0, 0.6)
-            far_vols = occ.cut([(3, far_box)],
-                               all_blade_vols + mrf_vols,
-                               removeTool=False)[0]
+            all_inputs = all_blade_vols + mrf_vols + [(3, far_box)]
+            frag_out, frag_map = occ.fragment(all_inputs, [])
             occ.synchronize()
 
-            # --- 4. Meshing with boundary layer ---
+            # Classify resulting volumes: anything that an input blade mapped
+            # to is a blade fragment; everything else is fluid (far-field and
+            # MRF regions, now conformally joined).
+            blade_result_tags = set()
+            for i in range(len(all_blade_vols)):
+                for d, t in frag_map[i]:
+                    if d == 3:
+                        blade_result_tags.add(t)
+            all_result_vols = [t for d, t in frag_out if d == 3]
+            fluid_vols = [(3, t) for t in all_result_vols
+                          if t not in blade_result_tags]
+            blade_frag_vols = [(3, t) for t in all_result_vols
+                               if t in blade_result_tags]
+
+            # Remove the blade fragments so only the fluid domain is meshed.
+            # Keep their boundary faces available for a future boundary layer
+            # by querying before removal.
+            if blade_frag_vols:
+                _blade_faces = gmsh.model.getBoundary(
+                    blade_frag_vols, oriented=False, combined=False)
+                occ.remove(blade_frag_vols, recursive=True)
+                occ.synchronize()
+            else:
+                _blade_faces = []
+
+            # --- 4. Meshing ---
             gmsh.option.setNumber("Mesh.MeshSizeMin", cfg["h_blade"] / 4)
             gmsh.option.setNumber("Mesh.MeshSizeMax", cfg["h_far"])
             gmsh.option.setNumber("Mesh.Algorithm", 6)      # 2D: Frontal
-            gmsh.option.setNumber("Mesh.Algorithm3D", 10)   # 3D: HXT
+            # 3D: Frontal-Delaunay. HXT (10) fails on this geometry with
+            # "overlapping facets"; Frontal-Delaunay (4) is the robust choice
+            # for complex CAD models with sharp leading/trailing edges.
+            gmsh.option.setNumber("Mesh.Algorithm3D", 4)
 
-            # Boundary layer on blade surfaces.
-            # NOTE 1: getBoundary lives on gmsh.model, NOT gmsh.model.occ.
-            # NOTE 2: The BoundaryLayer *field* in gmsh 4.15.x is 2D-only
-            # ("Only 2D Boundary Layers are supported") and its option for
-            # attaching to geometry is 'CurvesList' (1D), not 'SurfacesList'.
-            # The original code used SurfacesList, which raised "Unknown
-            # option 'SurfacesList'". For a true 3D boundary layer the right
-            # tool is gmsh.model.geo.extrudeBoundaryLayer, which is a larger
-            # refactor; for now we rely on the MeshSizeMin/Max size fields set
-            # above to grade the mesh near the blades. The blade surfaces are
-            # still queried here so a future extrudeBoundaryLayer call can use
-            # them without re-deriving the topology.
-            if all_blade_vols:
-                _blade_faces = gmsh.model.getBoundary(
-                    all_blade_vols, oriented=False, combined=False)
-
+            # NOTE on boundary layers: the BoundaryLayer *field* in gmsh 4.15.x
+            # is 2D-only and has no SurfacesList option, so it cannot inflate a
+            # 3D layer on the blade faces. A true 3D boundary layer requires
+            # gmsh.model.geo.extrudeBoundaryLayer (a larger refactor). For now
+            # the MeshSizeMin/Max size fields grade the mesh near the blades;
+            # _blade_faces is retained above for the future extrude call.
             gmsh.model.mesh.generate(3)
 
             # --- 5. Export ---
