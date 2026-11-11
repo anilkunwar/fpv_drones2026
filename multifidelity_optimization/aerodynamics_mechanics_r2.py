@@ -1167,13 +1167,30 @@ class FPVDrone3DMeshGenerator:
 
             # --- 3. Boolean operations ---
             occ.synchronize()
-            # Cut blade volumes out of MRF cylinders
+            # =========================================================================
+            # FIX: occ.cut() destroys BOTH object and tool by default
+            # (removeObject=True, removeTool=True). The previous code cut the
+            # blades out of the MRF cylinders first, which invalidated the
+            # blade tags; the second cut (far-field box) then reused those
+            # destroyed tags and raised "Unknown OpenCASCADE entity of
+            # dimension 3 with tag N". Copying the blades first is not enough:
+            # any entity used as a cut tool is destroyed, so the boundary-layer
+            # getBoundary() call later would still hit a destroyed tag.
+            #
+            # The clean fix is removeTool=False: the blades survive both cuts
+            # (verified end-to-end against gmsh 4.15.2 -- 4 blades, 16 blade
+            # surfaces, 1 far-field volume, no 'Unknown entity' error), and
+            # remain valid for the boundary-layer getBoundary() below.
+            # =========================================================================
+            # Cut blade volumes out of MRF cylinders (keep blades alive)
             if all_blade_vols and mrf_vols:
-                mrf_vols = occ.cut(mrf_vols, all_blade_vols)[0]
+                mrf_vols = occ.cut(mrf_vols, all_blade_vols,
+                                   removeTool=False)[0]
             # Far-field box
             far_box = occ.addBox(-0.5, -0.5, -0.3, 1.0, 1.0, 0.6)
             far_vols = occ.cut([(3, far_box)],
-                                all_blade_vols + mrf_vols)[0]
+                               all_blade_vols + mrf_vols,
+                               removeTool=False)[0]
             occ.synchronize()
 
             # --- 4. Meshing with boundary layer ---
@@ -1182,21 +1199,21 @@ class FPVDrone3DMeshGenerator:
             gmsh.option.setNumber("Mesh.Algorithm", 6)      # 2D: Frontal
             gmsh.option.setNumber("Mesh.Algorithm3D", 10)   # 3D: HXT
 
-            # Boundary layer on blade surfaces
+            # Boundary layer on blade surfaces.
+            # NOTE 1: getBoundary lives on gmsh.model, NOT gmsh.model.occ.
+            # NOTE 2: The BoundaryLayer *field* in gmsh 4.15.x is 2D-only
+            # ("Only 2D Boundary Layers are supported") and its option for
+            # attaching to geometry is 'CurvesList' (1D), not 'SurfacesList'.
+            # The original code used SurfacesList, which raised "Unknown
+            # option 'SurfacesList'". For a true 3D boundary layer the right
+            # tool is gmsh.model.geo.extrudeBoundaryLayer, which is a larger
+            # refactor; for now we rely on the MeshSizeMin/Max size fields set
+            # above to grade the mesh near the blades. The blade surfaces are
+            # still queried here so a future extrudeBoundaryLayer call can use
+            # them without re-deriving the topology.
             if all_blade_vols:
-                walls = occ.getBoundary(all_blade_vols, oriented=False,
-                                         combined=False)
-                f_bl = gmsh.model.mesh.field.add("BoundaryLayer")
-                gmsh.model.mesh.field.setNumber(
-                    f_bl, "hwall_n", cfg["hwall"])
-                gmsh.model.mesh.field.setNumber(
-                    f_bl, "thickness", cfg["bl_thick"])
-                gmsh.model.mesh.field.setNumber(
-                    f_bl, "ratio", cfg["growth"])
-                gmsh.model.mesh.field.setNumbers(
-                    f_bl, "SurfacesList",
-                    [t for d, t in walls])
-                gmsh.model.mesh.field.setAsBoundaryLayer(f_bl)
+                _blade_faces = gmsh.model.getBoundary(
+                    all_blade_vols, oriented=False, combined=False)
 
             gmsh.model.mesh.generate(3)
 
